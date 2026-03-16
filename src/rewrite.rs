@@ -137,7 +137,7 @@ fn with_parsed_program(
     mut visit: impl for<'a> FnMut(&oxc_ast::ast::Program<'a>),
 ) -> Result<(), Box<dyn Error>> {
     let allocator = Allocator::default();
-    let parser_return = Parser::new(&allocator, source, SourceType::cjs())
+    let parser_return = Parser::new(&allocator, source, SourceType::cjs().with_typescript(true))
         .with_options(ParseOptions {
             allow_return_outside_function: true,
             parse_regular_expression: true,
@@ -374,10 +374,8 @@ fn collect_assignment_target_names(target: &AssignmentTarget<'_>, names: &mut Ha
         | AssignmentTarget::StaticMemberExpression(_)
         | AssignmentTarget::PrivateFieldExpression(_) => {}
         AssignmentTarget::ArrayAssignmentTarget(pattern) => {
-            for item in &pattern.elements {
-                if let Some(item) = item {
-                    collect_assignment_target_maybe_default_names(item, names);
-                }
+            for item in (&pattern.elements).into_iter().flatten() {
+                collect_assignment_target_maybe_default_names(item, names);
             }
             if let Some(rest) = &pattern.rest {
                 collect_assignment_target_names(&rest.target, names);
@@ -425,10 +423,8 @@ fn collect_assignment_target_maybe_default_names(
         | AssignmentTargetMaybeDefault::StaticMemberExpression(_)
         | AssignmentTargetMaybeDefault::PrivateFieldExpression(_) => {}
         AssignmentTargetMaybeDefault::ArrayAssignmentTarget(pattern) => {
-            for item in &pattern.elements {
-                if let Some(item) = item {
-                    collect_assignment_target_maybe_default_names(item, names);
-                }
+            for item in (&pattern.elements).into_iter().flatten() {
+                collect_assignment_target_maybe_default_names(item, names);
             }
             if let Some(rest) = &pattern.rest {
                 collect_assignment_target_names(&rest.target, names);
@@ -459,20 +455,8 @@ fn collect_assignment_target_names_from_expression(
     expression: &Expression<'_>,
     names: &mut HashSet<String>,
 ) {
-    match expression {
-        Expression::TSAsExpression(expression) => {
-            collect_assignment_target_names_from_expression(&expression.expression, names);
-        }
-        Expression::TSSatisfiesExpression(expression) => {
-            collect_assignment_target_names_from_expression(&expression.expression, names);
-        }
-        Expression::TSNonNullExpression(expression) => {
-            collect_assignment_target_names_from_expression(&expression.expression, names);
-        }
-        Expression::TSTypeAssertion(expression) => {
-            collect_assignment_target_names_from_expression(&expression.expression, names);
-        }
-        _ => {}
+    if let Expression::Identifier(identifier) = expression.get_inner_expression() {
+        names.insert(identifier.name.as_str().to_string());
     }
 }
 
@@ -738,7 +722,7 @@ fn apply_replacements(
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_external_bundle_refs, infer_runtime_helper};
+    use super::{analyze_lazy_exports, collect_external_bundle_refs, infer_runtime_helper};
 
     #[test]
     fn collects_generic_bundle_refs() {
@@ -751,6 +735,15 @@ mod tests {
             refs,
             vec!["bundle_fn_2".to_string(), "bundle_var_1".to_string()]
         );
+    }
+
+    #[test]
+    fn tracks_ts_wrapped_assignment_targets_in_lazy_export_analysis() {
+        let analysis =
+            analyze_lazy_exports("", "(bundle_var_1 as any) = 1;").expect("analysis should parse");
+
+        assert_eq!(analysis.exports, vec!["bundle_var_1".to_string()]);
+        assert!(analysis.support_bindings.is_empty());
     }
 
     #[test]

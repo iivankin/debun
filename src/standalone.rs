@@ -15,7 +15,9 @@ const WINDOWS_BUNFS_ROOT_PREFIX: &str = "B:/~BUN/root/";
 const TRAILER: &[u8] = b"\n---- Bun! ----\n";
 
 const STRING_POINTER_SIZE: usize = 8;
-const MODULE_RECORD_SIZE: usize = 52;
+const MODULE_RECORD_SIZE_COMPACT: usize = 36;
+const MODULE_RECORD_SIZE_WITH_MODULE_INFO: usize = 44;
+const MODULE_RECORD_SIZE_EXTENDED: usize = 52;
 const OFFSETS_SIZE_64: usize = 32;
 
 #[derive(Debug, Clone)]
@@ -25,6 +27,9 @@ pub struct StandaloneInspection {
     pub raw_container_bytes: Option<Vec<u8>>,
     pub payload_file_offset: usize,
     pub payload_bytes: Vec<u8>,
+    pub record_layout: &'static str,
+    pub record_size: usize,
+    pub bun_version_hint: &'static str,
     pub files: Vec<StandaloneFile>,
     pub entry_point_path: Option<String>,
     pub entry_point_source: Option<String>,
@@ -35,6 +40,17 @@ pub struct StandaloneFile {
     pub virtual_path: String,
     pub source_offset: usize,
     pub bytes: Vec<u8>,
+    pub sourcemap: Option<Vec<u8>>,
+    pub sourcemap_offset: Option<usize>,
+    pub bytecode: Option<Vec<u8>>,
+    pub bytecode_offset: Option<usize>,
+    pub module_info: Option<Vec<u8>>,
+    pub module_info_offset: Option<usize>,
+    pub bytecode_origin_path: Option<String>,
+    pub encoding: u8,
+    pub loader: u8,
+    pub module_format: u8,
+    pub side: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -59,6 +75,53 @@ struct ContainerPayload<'a> {
     raw_container_bytes: Option<&'a [u8]>,
     payload_file_offset: usize,
     payload_bytes: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ModuleRecordLayout {
+    Compact,
+    WithModuleInfo,
+    Extended,
+}
+
+impl ModuleRecordLayout {
+    const fn size(self) -> usize {
+        match self {
+            Self::Compact => MODULE_RECORD_SIZE_COMPACT,
+            Self::WithModuleInfo => MODULE_RECORD_SIZE_WITH_MODULE_INFO,
+            Self::Extended => MODULE_RECORD_SIZE_EXTENDED,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::WithModuleInfo => "with-module-info",
+            Self::Extended => "extended",
+        }
+    }
+
+    const fn bun_version_hint(self) -> &'static str {
+        match self {
+            Self::Compact => "bun-v1.1.x..v1.3.5",
+            Self::WithModuleInfo => "post-v1.3.5 pre-v1.3.10",
+            Self::Extended => "bun-v1.3.10+",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedModuleRecord {
+    name: String,
+    contents_ptr: RawStringPointer,
+    sourcemap_ptr: RawStringPointer,
+    bytecode_ptr: RawStringPointer,
+    module_info_ptr: RawStringPointer,
+    bytecode_origin_path: Option<String>,
+    encoding: u8,
+    loader: u8,
+    module_format: u8,
+    side: u8,
 }
 
 pub fn inspect_executable(bytes: &[u8]) -> Result<Option<StandaloneInspection>, Box<dyn Error>> {
@@ -200,39 +263,19 @@ fn parse_payload(payload: ContainerPayload<'_>) -> Result<StandaloneInspection, 
     let body = &payload.payload_bytes[..offsets.byte_count];
     let modules_bytes = slice_pointer(body, offsets.modules_ptr)
         .ok_or("standalone payload module list pointer was out of bounds")?;
-    if modules_bytes.len() % MODULE_RECORD_SIZE != 0 {
-        return Err("standalone payload module list had an invalid size".into());
-    }
+    let (record_layout, records) =
+        parse_module_records(body, modules_bytes, offsets.entry_point_id)?;
 
     let mut files = Vec::new();
     let mut entry_point_path = None;
     let mut entry_point_source = None;
 
-    for (index, module_bytes) in modules_bytes.chunks_exact(MODULE_RECORD_SIZE).enumerate() {
-        let name_ptr = parse_string_pointer(
-            module_bytes
-                .get(0..STRING_POINTER_SIZE)
-                .ok_or("module name pointer was out of bounds")?,
-        )
-        .ok_or("module name pointer was invalid")?;
-        let contents_ptr = parse_string_pointer(
-            module_bytes
-                .get(STRING_POINTER_SIZE..STRING_POINTER_SIZE * 2)
-                .ok_or("module contents pointer was out of bounds")?,
-        )
-        .ok_or("module contents pointer was invalid")?;
-
-        let Some(name_bytes) = slice_pointer(body, name_ptr) else {
-            continue;
-        };
-        let Some(contents_bytes) = slice_pointer(body, contents_ptr) else {
-            continue;
-        };
-        let Ok(name) = std::str::from_utf8(name_bytes) else {
+    for (index, record) in records.iter().enumerate() {
+        let Some(contents_bytes) = slice_pointer(body, record.contents_ptr) else {
             continue;
         };
 
-        let normalized_path = normalize_virtual_path(name);
+        let normalized_path = normalize_virtual_path(&record.name);
         if index == offsets.entry_point_id as usize {
             entry_point_path = Some(normalized_path.clone());
             if looks_like_javascript_source(contents_bytes) {
@@ -240,14 +283,25 @@ fn parse_payload(payload: ContainerPayload<'_>) -> Result<StandaloneInspection, 
             }
         }
 
-        if !is_bunfs_virtual_path(name) {
+        if !is_bunfs_virtual_path(&record.name) {
             continue;
         }
 
         files.push(StandaloneFile {
             virtual_path: normalized_path,
-            source_offset: contents_ptr.offset as usize,
+            source_offset: record.contents_ptr.offset as usize,
             bytes: contents_bytes.to_vec(),
+            sourcemap: slice_optional_pointer(body, record.sourcemap_ptr).map(<[u8]>::to_vec),
+            sourcemap_offset: non_empty_pointer_offset(record.sourcemap_ptr),
+            bytecode: slice_optional_pointer(body, record.bytecode_ptr).map(<[u8]>::to_vec),
+            bytecode_offset: non_empty_pointer_offset(record.bytecode_ptr),
+            module_info: slice_optional_pointer(body, record.module_info_ptr).map(<[u8]>::to_vec),
+            module_info_offset: non_empty_pointer_offset(record.module_info_ptr),
+            bytecode_origin_path: record.bytecode_origin_path.clone(),
+            encoding: record.encoding,
+            loader: record.loader,
+            module_format: record.module_format,
+            side: record.side,
         });
     }
 
@@ -257,16 +311,163 @@ fn parse_payload(payload: ContainerPayload<'_>) -> Result<StandaloneInspection, 
         raw_container_bytes: payload.raw_container_bytes.map(<[u8]>::to_vec),
         payload_file_offset: payload.payload_file_offset,
         payload_bytes: payload.payload_bytes.to_vec(),
+        record_layout: record_layout.label(),
+        record_size: record_layout.size(),
+        bun_version_hint: record_layout.bun_version_hint(),
         files,
         entry_point_path,
         entry_point_source,
     })
 }
 
-fn slice_pointer<'a>(bytes: &'a [u8], pointer: RawStringPointer) -> Option<&'a [u8]> {
+fn parse_module_records(
+    body: &[u8],
+    modules_bytes: &[u8],
+    entry_point_id: u32,
+) -> Result<(ModuleRecordLayout, Vec<ParsedModuleRecord>), Box<dyn Error>> {
+    let mut best_match = None;
+
+    // Bun's standalone graph record format changed across releases.
+    // We only need the leading name/contents pointers, so detect the layout
+    // by validating known record sizes against the actual module names.
+    for layout in [
+        ModuleRecordLayout::Extended,
+        ModuleRecordLayout::WithModuleInfo,
+        ModuleRecordLayout::Compact,
+    ] {
+        let Some(candidate) = try_parse_module_records(body, modules_bytes, entry_point_id, layout)
+        else {
+            continue;
+        };
+
+        let score = candidate
+            .iter()
+            .filter(|record| is_bunfs_virtual_path(&record.name))
+            .count();
+
+        match &best_match {
+            Some((best_score, _, _)) if *best_score >= score => {}
+            _ => best_match = Some((score, layout, candidate)),
+        }
+    }
+
+    if let Some((_, layout, records)) = best_match {
+        Ok((layout, records))
+    } else {
+        Err("standalone payload module list did not match any supported record layout".into())
+    }
+}
+
+fn try_parse_module_records(
+    body: &[u8],
+    modules_bytes: &[u8],
+    entry_point_id: u32,
+    layout: ModuleRecordLayout,
+) -> Option<Vec<ParsedModuleRecord>> {
+    let record_size = layout.size();
+    if !modules_bytes.len().is_multiple_of(record_size) {
+        return None;
+    }
+
+    let mut records = Vec::with_capacity(modules_bytes.len() / record_size);
+    for module_bytes in modules_bytes.chunks_exact(record_size) {
+        let name_ptr = parse_string_pointer(module_bytes.get(0..STRING_POINTER_SIZE)?)?;
+        let contents_ptr =
+            parse_string_pointer(module_bytes.get(STRING_POINTER_SIZE..STRING_POINTER_SIZE * 2)?)?;
+        let sourcemap_ptr = parse_string_pointer(
+            module_bytes.get(STRING_POINTER_SIZE * 2..STRING_POINTER_SIZE * 3)?,
+        )?;
+        let bytecode_ptr = parse_string_pointer(
+            module_bytes.get(STRING_POINTER_SIZE * 3..STRING_POINTER_SIZE * 4)?,
+        )?;
+        let (module_info_ptr, bytecode_origin_path, tail_start) = match layout {
+            ModuleRecordLayout::Compact => (
+                RawStringPointer {
+                    offset: 0,
+                    length: 0,
+                },
+                None,
+                STRING_POINTER_SIZE * 4,
+            ),
+            ModuleRecordLayout::WithModuleInfo => (
+                parse_string_pointer(
+                    module_bytes.get(STRING_POINTER_SIZE * 4..STRING_POINTER_SIZE * 5)?,
+                )?,
+                None,
+                STRING_POINTER_SIZE * 5,
+            ),
+            ModuleRecordLayout::Extended => {
+                let module_info_ptr = parse_string_pointer(
+                    module_bytes.get(STRING_POINTER_SIZE * 4..STRING_POINTER_SIZE * 5)?,
+                )?;
+                let origin_path_ptr = parse_string_pointer(
+                    module_bytes.get(STRING_POINTER_SIZE * 5..STRING_POINTER_SIZE * 6)?,
+                )?;
+                let bytecode_origin_path = if origin_path_ptr.length > 0 {
+                    Some(
+                        std::str::from_utf8(slice_pointer(body, origin_path_ptr)?)
+                            .ok()?
+                            .to_string(),
+                    )
+                } else {
+                    None
+                };
+                (
+                    module_info_ptr,
+                    bytecode_origin_path,
+                    STRING_POINTER_SIZE * 6,
+                )
+            }
+        };
+        let tail = module_bytes.get(tail_start..tail_start + 4)?;
+        let encoding = *tail.first()?;
+        let loader = *tail.get(1)?;
+        let module_format = *tail.get(2)?;
+        let side = *tail.get(3)?;
+        if encoding > 2 || module_format > 2 || side > 1 {
+            return None;
+        }
+        let name_bytes = slice_pointer(body, name_ptr)?;
+        let name = std::str::from_utf8(name_bytes).ok()?.to_string();
+        if name.is_empty() || name.chars().any(|ch| ch.is_control()) {
+            return None;
+        }
+        records.push(ParsedModuleRecord {
+            name,
+            contents_ptr,
+            sourcemap_ptr,
+            bytecode_ptr,
+            module_info_ptr,
+            bytecode_origin_path,
+            encoding,
+            loader,
+            module_format,
+            side,
+        });
+    }
+
+    let entry_index = usize::try_from(entry_point_id).ok()?;
+    if entry_index >= records.len() {
+        return None;
+    }
+
+    Some(records)
+}
+
+fn slice_pointer(bytes: &[u8], pointer: RawStringPointer) -> Option<&[u8]> {
     let start = pointer.offset as usize;
     let end = start.checked_add(pointer.length as usize)?;
     bytes.get(start..end)
+}
+
+fn slice_optional_pointer(bytes: &[u8], pointer: RawStringPointer) -> Option<&[u8]> {
+    (pointer.length > 0)
+        .then(|| slice_pointer(bytes, pointer))
+        .flatten()
+}
+
+fn non_empty_pointer_offset(pointer: RawStringPointer) -> Option<usize> {
+    (pointer.length > 0).then_some(pointer.offset as usize)
 }
 
 fn looks_like_javascript_source(bytes: &[u8]) -> bool {
@@ -453,8 +654,47 @@ fn read_u64_le(bytes: &[u8], start: usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MODULE_RECORD_SIZE, OFFSETS_SIZE_64, STRING_POINTER_SIZE, TRAILER, inspect_executable,
+        MODULE_RECORD_SIZE_COMPACT, MODULE_RECORD_SIZE_EXTENDED,
+        MODULE_RECORD_SIZE_WITH_MODULE_INFO, OFFSETS_SIZE_64, STRING_POINTER_SIZE, TRAILER,
+        inspect_executable,
     };
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestModule<'a> {
+        name: &'a str,
+        contents: &'a [u8],
+        sourcemap: &'a [u8],
+        bytecode: &'a [u8],
+        module_info: &'a [u8],
+        bytecode_origin_path: Option<&'a str>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestModulePointers {
+        name: (u32, u32),
+        contents: (u32, u32),
+        sourcemap: (u32, u32),
+        bytecode: (u32, u32),
+        module_info: (u32, u32),
+        bytecode_origin_path: Option<(u32, u32)>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum TestModuleRecordLayout {
+        Compact,
+        WithModuleInfo,
+        Extended,
+    }
+
+    impl TestModuleRecordLayout {
+        const fn size(self) -> usize {
+            match self {
+                Self::Compact => MODULE_RECORD_SIZE_COMPACT,
+                Self::WithModuleInfo => MODULE_RECORD_SIZE_WITH_MODULE_INFO,
+                Self::Extended => MODULE_RECORD_SIZE_EXTENDED,
+            }
+        }
+    }
 
     fn push_bytes(body: &mut Vec<u8>, bytes: &[u8]) -> (u32, u32) {
         let offset = body.len() as u32;
@@ -467,24 +707,59 @@ mod tests {
         out.extend_from_slice(&length.to_le_bytes());
     }
 
-    fn push_module_record(out: &mut Vec<u8>, name: (u32, u32), contents: (u32, u32)) {
-        push_string_pointer(out, name.0, name.1);
-        push_string_pointer(out, contents.0, contents.1);
-        for _ in 0..4 {
-            push_string_pointer(out, 0, 0);
+    fn push_module_record(
+        out: &mut Vec<u8>,
+        layout: TestModuleRecordLayout,
+        pointers: TestModulePointers,
+    ) {
+        push_string_pointer(out, pointers.name.0, pointers.name.1);
+        push_string_pointer(out, pointers.contents.0, pointers.contents.1);
+        push_string_pointer(out, pointers.sourcemap.0, pointers.sourcemap.1);
+        push_string_pointer(out, pointers.bytecode.0, pointers.bytecode.1);
+        match layout {
+            TestModuleRecordLayout::Compact => {}
+            TestModuleRecordLayout::WithModuleInfo => {
+                push_string_pointer(out, pointers.module_info.0, pointers.module_info.1);
+            }
+            TestModuleRecordLayout::Extended => {
+                push_string_pointer(out, pointers.module_info.0, pointers.module_info.1);
+                let origin = pointers.bytecode_origin_path.unwrap_or((0, 0));
+                push_string_pointer(out, origin.0, origin.1);
+            }
         }
-        out.extend_from_slice(&[0, 0, 0, 0]);
-        assert_eq!(out.len() % MODULE_RECORD_SIZE, 0);
+        out.extend_from_slice(&[1, 1, 1, 0]);
+        assert_eq!(out.len() % layout.size(), 0);
     }
 
-    fn build_payload(files: &[(&str, &[u8])], entry_point_id: u32) -> Vec<u8> {
+    fn build_payload(
+        files: &[TestModule<'_>],
+        entry_point_id: u32,
+        layout: TestModuleRecordLayout,
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         let mut modules = Vec::new();
 
-        for (name, contents) in files {
-            let name_ptr = push_bytes(&mut body, name.as_bytes());
-            let contents_ptr = push_bytes(&mut body, contents);
-            push_module_record(&mut modules, name_ptr, contents_ptr);
+        for file in files {
+            let name_ptr = push_bytes(&mut body, file.name.as_bytes());
+            let contents_ptr = push_bytes(&mut body, file.contents);
+            let sourcemap_ptr = push_bytes(&mut body, file.sourcemap);
+            let bytecode_ptr = push_bytes(&mut body, file.bytecode);
+            let module_info_ptr = push_bytes(&mut body, file.module_info);
+            let origin_path_ptr = file
+                .bytecode_origin_path
+                .map(|value| push_bytes(&mut body, value.as_bytes()));
+            push_module_record(
+                &mut modules,
+                layout,
+                TestModulePointers {
+                    name: name_ptr,
+                    contents: contents_ptr,
+                    sourcemap: sourcemap_ptr,
+                    bytecode: bytecode_ptr,
+                    module_info: module_info_ptr,
+                    bytecode_origin_path: origin_path_ptr,
+                },
+            );
         }
 
         let modules_offset = body.len() as u32;
@@ -508,13 +783,28 @@ mod tests {
     }
 
     #[test]
-    fn parses_appended_standalone_graph() {
+    fn parses_appended_standalone_graph_with_extended_records() {
         let payload = build_payload(
             &[
-                ("/$bunfs/root/app.js", b"// @bun\nconsole.log('entry');\n"),
-                ("B:/~BUN/root/chunk.wasm", b"\0asm\x01\0\0\0"),
+                TestModule {
+                    name: "/$bunfs/root/app.js",
+                    contents: b"// @bun\nconsole.log('entry');\n",
+                    sourcemap: b"SMAP",
+                    bytecode: b"BYTE",
+                    module_info: b"META",
+                    bytecode_origin_path: Some("B:/~BUN/root/app.js"),
+                },
+                TestModule {
+                    name: "B:/~BUN/root/chunk.wasm",
+                    contents: b"\0asm\x01\0\0\0",
+                    sourcemap: b"",
+                    bytecode: b"",
+                    module_info: b"",
+                    bytecode_origin_path: None,
+                },
             ],
             0,
+            TestModuleRecordLayout::Extended,
         );
 
         let mut exe = vec![0x7f, b'E', b'L', b'F'];
@@ -528,6 +818,9 @@ mod tests {
             .expect("parser should find an appended payload");
 
         assert_eq!(inspection.payload_file_offset, payload_offset);
+        assert_eq!(inspection.record_layout, "extended");
+        assert_eq!(inspection.record_size, MODULE_RECORD_SIZE_EXTENDED);
+        assert_eq!(inspection.bun_version_hint, "bun-v1.3.10+");
         assert_eq!(inspection.files.len(), 2);
         assert_eq!(inspection.files[0].virtual_path, "/$bunfs/root/app.js");
         assert_eq!(inspection.files[1].virtual_path, "/$bunfs/root/chunk.wasm");
@@ -539,5 +832,132 @@ mod tests {
             inspection.entry_point_source.as_deref(),
             Some("// @bun\nconsole.log('entry');\n")
         );
+        assert_eq!(
+            inspection.files[0].sourcemap.as_deref(),
+            Some(b"SMAP".as_slice())
+        );
+        assert_eq!(
+            inspection.files[0].bytecode.as_deref(),
+            Some(b"BYTE".as_slice())
+        );
+        assert_eq!(
+            inspection.files[0].module_info.as_deref(),
+            Some(b"META".as_slice())
+        );
+        assert_eq!(
+            inspection.files[0].bytecode_origin_path.as_deref(),
+            Some("B:/~BUN/root/app.js")
+        );
+    }
+
+    #[test]
+    fn parses_appended_standalone_graph_with_module_info_records() {
+        let payload = build_payload(
+            &[
+                TestModule {
+                    name: "/$bunfs/root/app.js",
+                    contents: b"// @bun\nconsole.log('entry');\n",
+                    sourcemap: b"SMAP",
+                    bytecode: b"BYTE",
+                    module_info: b"META",
+                    bytecode_origin_path: None,
+                },
+                TestModule {
+                    name: "B:/~BUN/root/chunk.wasm",
+                    contents: b"\0asm\x01\0\0\0",
+                    sourcemap: b"",
+                    bytecode: b"",
+                    module_info: b"",
+                    bytecode_origin_path: None,
+                },
+            ],
+            0,
+            TestModuleRecordLayout::WithModuleInfo,
+        );
+
+        let mut exe = vec![0x7f, b'E', b'L', b'F'];
+        exe.resize(128, 0);
+        exe.extend_from_slice(&payload);
+        exe.extend_from_slice(&(exe.len() as u64 + 8).to_le_bytes());
+
+        let inspection = inspect_executable(&exe)
+            .expect("parser should not fail")
+            .expect("parser should find an appended payload");
+
+        assert_eq!(inspection.record_layout, "with-module-info");
+        assert_eq!(inspection.record_size, MODULE_RECORD_SIZE_WITH_MODULE_INFO);
+        assert_eq!(
+            inspection.files[0].sourcemap.as_deref(),
+            Some(b"SMAP".as_slice())
+        );
+        assert_eq!(
+            inspection.files[0].bytecode.as_deref(),
+            Some(b"BYTE".as_slice())
+        );
+        assert_eq!(
+            inspection.files[0].module_info.as_deref(),
+            Some(b"META".as_slice())
+        );
+        assert_eq!(inspection.files[0].bytecode_origin_path, None);
+    }
+
+    #[test]
+    fn parses_appended_standalone_graph_with_compact_records() {
+        let payload = build_payload(
+            &[
+                TestModule {
+                    name: "/$bunfs/root/app.js",
+                    contents: b"// @bun\nconsole.log('entry');\n",
+                    sourcemap: b"SMAP",
+                    bytecode: b"BYTE",
+                    module_info: b"",
+                    bytecode_origin_path: None,
+                },
+                TestModule {
+                    name: "B:/~BUN/root/chunk.wasm",
+                    contents: b"\0asm\x01\0\0\0",
+                    sourcemap: b"",
+                    bytecode: b"",
+                    module_info: b"",
+                    bytecode_origin_path: None,
+                },
+            ],
+            0,
+            TestModuleRecordLayout::Compact,
+        );
+
+        let mut exe = vec![0x7f, b'E', b'L', b'F'];
+        exe.resize(128, 0);
+        let payload_offset = exe.len();
+        exe.extend_from_slice(&payload);
+        exe.extend_from_slice(&(exe.len() as u64 + 8).to_le_bytes());
+
+        let inspection = inspect_executable(&exe)
+            .expect("parser should not fail")
+            .expect("parser should find an appended payload");
+
+        assert_eq!(inspection.payload_file_offset, payload_offset);
+        assert_eq!(inspection.record_layout, "compact");
+        assert_eq!(inspection.record_size, MODULE_RECORD_SIZE_COMPACT);
+        assert_eq!(inspection.files.len(), 2);
+        assert_eq!(inspection.files[0].virtual_path, "/$bunfs/root/app.js");
+        assert_eq!(inspection.files[1].virtual_path, "/$bunfs/root/chunk.wasm");
+        assert_eq!(
+            inspection.entry_point_path.as_deref(),
+            Some("/$bunfs/root/app.js")
+        );
+        assert_eq!(
+            inspection.entry_point_source.as_deref(),
+            Some("// @bun\nconsole.log('entry');\n")
+        );
+        assert_eq!(
+            inspection.files[0].sourcemap.as_deref(),
+            Some(b"SMAP".as_slice())
+        );
+        assert_eq!(
+            inspection.files[0].bytecode.as_deref(),
+            Some(b"BYTE".as_slice())
+        );
+        assert_eq!(inspection.files[0].module_info, None);
     }
 }

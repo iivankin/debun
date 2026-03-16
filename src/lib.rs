@@ -6,6 +6,7 @@ mod output;
 mod rewrite;
 mod split;
 mod standalone;
+mod standalone_decode;
 
 use std::{error::Error, fs};
 
@@ -34,6 +35,15 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     println!("output: {}", config.out_dir.display());
     if let Some(primary_output) = &output_summary.primary_output {
         println!("primary: {primary_output}");
+    }
+    if let Some(inspection) = &inspection
+        && let Some(record_size) = inspection.standalone_record_size
+    {
+        if let Some(version_hint) = inspection.bun_version_hint {
+            println!("bun version hint: {version_hint} ({record_size}-byte standalone record)");
+        } else {
+            println!("standalone record size: {record_size}");
+        }
     }
     if output_summary.wrote_symbols {
         println!("rename map: symbols.txt");

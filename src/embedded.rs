@@ -1,6 +1,9 @@
 use std::{collections::BTreeMap, error::Error, fs, path::Path};
 
-use crate::standalone::{StandaloneFile, inspect_executable};
+use crate::{
+    standalone::{StandaloneFile, inspect_executable},
+    standalone_decode::{decode_module_info, decode_serialized_sourcemap},
+};
 
 const MACH_O_MAGIC_64: u32 = 0xfeedfacf;
 const MACH_O_MAGIC_32: u32 = 0xfeedface;
@@ -24,6 +27,9 @@ pub struct BinaryInspection {
     pub bun_section_headerless_offset: Option<usize>,
     pub standalone_graph_file_offset: Option<usize>,
     pub standalone_graph_bytes: Option<Vec<u8>>,
+    pub standalone_layout: Option<&'static str>,
+    pub standalone_record_size: Option<usize>,
+    pub bun_version_hint: Option<&'static str>,
     pub bunfs_paths: Vec<String>,
     pub metadata: Vec<(String, String)>,
     pub files: Vec<EmbeddedFile>,
@@ -37,6 +43,13 @@ pub struct EmbeddedFile {
     pub kind: EmbeddedKind,
     pub source_offset: usize,
     pub bytes: Vec<u8>,
+    pub derived_from: Option<String>,
+    pub standalone_role: Option<&'static str>,
+    pub standalone_encoding: Option<&'static str>,
+    pub standalone_loader_id: Option<u8>,
+    pub standalone_module_format: Option<&'static str>,
+    pub standalone_side: Option<&'static str>,
+    pub standalone_bytecode_origin_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +62,11 @@ pub enum EmbeddedKind {
     Text,
     WebManifest,
     Png,
+    StandaloneSourceMap,
+    StandaloneSourceMapJson,
+    StandaloneBytecode,
+    StandaloneModuleInfo,
+    StandaloneModuleInfoJson,
 }
 
 impl EmbeddedKind {
@@ -62,6 +80,11 @@ impl EmbeddedKind {
             Self::Text => "text",
             Self::WebManifest => "webmanifest",
             Self::Png => "png",
+            Self::StandaloneSourceMap => "standalone-sourcemap",
+            Self::StandaloneSourceMapJson => "standalone-sourcemap-json",
+            Self::StandaloneBytecode => "standalone-bytecode",
+            Self::StandaloneModuleInfo => "standalone-module-info",
+            Self::StandaloneModuleInfoJson => "standalone-module-info-json",
         }
     }
 }
@@ -108,6 +131,9 @@ fn inspect_binary_bytes(bytes: &[u8]) -> Result<Option<BinaryInspection>, Box<dy
                 .map(|_| std::mem::size_of::<u64>()),
             standalone_graph_file_offset: Some(standalone.payload_file_offset),
             standalone_graph_bytes: Some(payload_bytes),
+            standalone_layout: Some(standalone.record_layout),
+            standalone_record_size: Some(standalone.record_size),
+            bun_version_hint: Some(standalone.bun_version_hint),
             bunfs_paths,
             metadata,
             files: if structured_files.is_empty() {
@@ -145,6 +171,9 @@ fn inspect_binary_bytes(bytes: &[u8]) -> Result<Option<BinaryInspection>, Box<dy
         bun_section_headerless_offset: headerless_offset,
         standalone_graph_file_offset: None,
         standalone_graph_bytes: None,
+        standalone_layout: None,
+        standalone_record_size: None,
+        bun_version_hint: None,
         bunfs_paths,
         metadata,
         files,
@@ -154,18 +183,114 @@ fn inspect_binary_bytes(bytes: &[u8]) -> Result<Option<BinaryInspection>, Box<dy
 }
 
 fn structured_embedded_files(files: &[StandaloneFile]) -> Vec<EmbeddedFile> {
-    files
-        .iter()
-        .filter_map(|file| {
-            let kind = detect_kind(&file.virtual_path, &file.bytes)?;
-            Some(EmbeddedFile {
-                virtual_path: file.virtual_path.clone(),
-                kind,
-                source_offset: file.source_offset,
-                bytes: file.bytes.clone(),
-            })
-        })
-        .collect()
+    let mut extracted = Vec::new();
+
+    for file in files {
+        let Some(kind) = detect_kind(&file.virtual_path, &file.bytes) else {
+            continue;
+        };
+        let encoding = standalone_encoding_label(file.encoding);
+        let module_format = standalone_module_format_label(file.module_format);
+        let side = standalone_side_label(file.side);
+
+        extracted.push(EmbeddedFile {
+            virtual_path: file.virtual_path.clone(),
+            kind,
+            source_offset: file.source_offset,
+            bytes: file.bytes.clone(),
+            derived_from: None,
+            standalone_role: Some("contents"),
+            standalone_encoding: encoding,
+            standalone_loader_id: Some(file.loader),
+            standalone_module_format: module_format,
+            standalone_side: side,
+            standalone_bytecode_origin_path: file.bytecode_origin_path.clone(),
+        });
+
+        if let Some(sourcemap) = &file.sourcemap {
+            let sourcemap_path = format!("{}.debun-sourcemap.bin", file.virtual_path);
+            extracted.push(EmbeddedFile {
+                virtual_path: sourcemap_path.clone(),
+                kind: EmbeddedKind::StandaloneSourceMap,
+                source_offset: file.sourcemap_offset.unwrap_or(file.source_offset),
+                bytes: sourcemap.clone(),
+                derived_from: Some(file.virtual_path.clone()),
+                standalone_role: Some("sourcemap"),
+                standalone_encoding: None,
+                standalone_loader_id: Some(file.loader),
+                standalone_module_format: module_format,
+                standalone_side: side,
+                standalone_bytecode_origin_path: None,
+            });
+
+            if let Ok(decoded) = decode_serialized_sourcemap(sourcemap, &file.virtual_path) {
+                extracted.push(EmbeddedFile {
+                    virtual_path: format!("{}.debun-sourcemap.json", file.virtual_path),
+                    kind: EmbeddedKind::StandaloneSourceMapJson,
+                    source_offset: file.sourcemap_offset.unwrap_or(file.source_offset),
+                    bytes: decoded.render_json().into_bytes(),
+                    derived_from: Some(sourcemap_path),
+                    standalone_role: Some("sourcemap-decoded"),
+                    standalone_encoding: None,
+                    standalone_loader_id: Some(file.loader),
+                    standalone_module_format: module_format,
+                    standalone_side: side,
+                    standalone_bytecode_origin_path: None,
+                });
+            }
+        }
+
+        if let Some(bytecode) = &file.bytecode {
+            extracted.push(EmbeddedFile {
+                virtual_path: format!("{}.debun-bytecode.bin", file.virtual_path),
+                kind: EmbeddedKind::StandaloneBytecode,
+                source_offset: file.bytecode_offset.unwrap_or(file.source_offset),
+                bytes: bytecode.clone(),
+                derived_from: Some(file.virtual_path.clone()),
+                standalone_role: Some("bytecode"),
+                standalone_encoding: None,
+                standalone_loader_id: Some(file.loader),
+                standalone_module_format: module_format,
+                standalone_side: side,
+                standalone_bytecode_origin_path: file.bytecode_origin_path.clone(),
+            });
+        }
+
+        if let Some(module_info) = &file.module_info {
+            let module_info_path = format!("{}.debun-module-info.bin", file.virtual_path);
+            extracted.push(EmbeddedFile {
+                virtual_path: module_info_path.clone(),
+                kind: EmbeddedKind::StandaloneModuleInfo,
+                source_offset: file.module_info_offset.unwrap_or(file.source_offset),
+                bytes: module_info.clone(),
+                derived_from: Some(file.virtual_path.clone()),
+                standalone_role: Some("module-info"),
+                standalone_encoding: None,
+                standalone_loader_id: Some(file.loader),
+                standalone_module_format: module_format,
+                standalone_side: side,
+                standalone_bytecode_origin_path: None,
+            });
+
+            if let Ok(decoded) = decode_module_info(module_info) {
+                extracted.push(EmbeddedFile {
+                    virtual_path: format!("{}.debun-module-info.json", file.virtual_path),
+                    kind: EmbeddedKind::StandaloneModuleInfoJson,
+                    source_offset: file.module_info_offset.unwrap_or(file.source_offset),
+                    bytes: decoded.render_json().into_bytes(),
+                    derived_from: Some(module_info_path),
+                    standalone_role: Some("module-info-decoded"),
+                    standalone_encoding: None,
+                    standalone_loader_id: Some(file.loader),
+                    standalone_module_format: module_format,
+                    standalone_side: side,
+                    standalone_bytecode_origin_path: None,
+                });
+            }
+        }
+    }
+
+    extracted
 }
 
 fn find_bun_section(bytes: &[u8]) -> Option<BunSection> {
@@ -270,7 +395,12 @@ fn extract_embedded_files(bytes: &[u8]) -> Vec<EmbeddedFile> {
             EmbeddedKind::Html
             | EmbeddedKind::Css
             | EmbeddedKind::Text
-            | EmbeddedKind::WebManifest => bytes[content_start..]
+            | EmbeddedKind::WebManifest
+            | EmbeddedKind::StandaloneSourceMap
+            | EmbeddedKind::StandaloneSourceMapJson
+            | EmbeddedKind::StandaloneBytecode
+            | EmbeddedKind::StandaloneModuleInfo
+            | EmbeddedKind::StandaloneModuleInfoJson => bytes[content_start..]
                 .iter()
                 .position(|byte| *byte == 0)
                 .map(|offset| content_start + offset)
@@ -294,6 +424,13 @@ fn extract_embedded_files(bytes: &[u8]) -> Vec<EmbeddedFile> {
                 kind,
                 source_offset: occurrence.offset,
                 bytes: content.to_vec(),
+                derived_from: None,
+                standalone_role: None,
+                standalone_encoding: None,
+                standalone_loader_id: None,
+                standalone_module_format: None,
+                standalone_side: None,
+                standalone_bytecode_origin_path: None,
             });
     }
 
@@ -352,6 +489,32 @@ fn detect_kind(path: &str, bytes: &[u8]) -> Option<EmbeddedKind> {
     let magic = read_u32_le(bytes, 0)?;
     match magic {
         MACH_O_MAGIC_64 | MACH_O_MAGIC_32 => Some(EmbeddedKind::MachO),
+        _ => None,
+    }
+}
+
+fn standalone_encoding_label(value: u8) -> Option<&'static str> {
+    match value {
+        0 => Some("binary"),
+        1 => Some("latin1"),
+        2 => Some("utf8"),
+        _ => None,
+    }
+}
+
+fn standalone_module_format_label(value: u8) -> Option<&'static str> {
+    match value {
+        0 => Some("none"),
+        1 => Some("esm"),
+        2 => Some("cjs"),
+        _ => None,
+    }
+}
+
+fn standalone_side_label(value: u8) -> Option<&'static str> {
+    match value {
+        0 => Some("server"),
+        1 => Some("client"),
         _ => None,
     }
 }
@@ -617,7 +780,7 @@ fn read_c_string_like(bytes: &[u8], start: usize) -> Option<String> {
         if byte == 0 {
             break;
         }
-        if byte < 0x20 || byte > 0x7e {
+        if !(0x20..=0x7e).contains(&byte) {
             return None;
         }
         end += 1;
@@ -801,4 +964,48 @@ fn read_u32_be(bytes: &[u8], start: usize) -> Option<u32> {
 fn read_u64_le(bytes: &[u8], start: usize) -> Option<u64> {
     let slice = bytes.get(start..start + 8)?;
     Some(u64::from_le_bytes(slice.try_into().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EmbeddedKind, structured_embedded_files};
+    use crate::standalone::StandaloneFile;
+
+    #[test]
+    fn structured_standalone_files_include_sidecars() {
+        let files = structured_embedded_files(&[StandaloneFile {
+            virtual_path: "/$bunfs/root/index.js".to_string(),
+            source_offset: 123,
+            bytes: b"// @bun\nconsole.log('entry');\n".to_vec(),
+            sourcemap: Some(b"SMAP".to_vec()),
+            sourcemap_offset: Some(456),
+            bytecode: Some(b"BYTE".to_vec()),
+            bytecode_offset: Some(789),
+            module_info: Some(b"META".to_vec()),
+            module_info_offset: Some(999),
+            bytecode_origin_path: Some("B:/~BUN/root/index.js".to_string()),
+            encoding: 1,
+            loader: 1,
+            module_format: 1,
+            side: 0,
+        }]);
+
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[0].kind, EmbeddedKind::JsWrapper);
+        assert_eq!(files[0].standalone_role, Some("contents"));
+        assert_eq!(
+            files[0].standalone_bytecode_origin_path.as_deref(),
+            Some("B:/~BUN/root/index.js")
+        );
+        assert_eq!(files[1].kind, EmbeddedKind::StandaloneSourceMap);
+        assert_eq!(
+            files[1].derived_from.as_deref(),
+            Some("/$bunfs/root/index.js")
+        );
+        assert_eq!(files[1].source_offset, 456);
+        assert_eq!(files[2].kind, EmbeddedKind::StandaloneBytecode);
+        assert_eq!(files[2].source_offset, 789);
+        assert_eq!(files[3].kind, EmbeddedKind::StandaloneModuleInfo);
+        assert_eq!(files[3].source_offset, 999);
+    }
 }

@@ -182,7 +182,7 @@ fn render_summary_json(
     outputs: &OutputSummary,
 ) -> String {
     let embedded_files = inspection.map(|value| value.files.len()).unwrap_or(0);
-    let fields = vec![
+    let fields = [
         json_field("input", &config.input.display().to_string()),
         json_field("module_name", &config.module_name),
         json_bool_field("rename_enabled", config.rename_symbols),
@@ -243,15 +243,7 @@ fn render_embedded_manifest_json(inspection: &BinaryInspection) -> String {
     let files_json = inspection
         .files
         .iter()
-        .map(|file| {
-            format!(
-                "{{\"path\":{},\"kind\":{},\"size\":{},\"source_offset\":{}}}",
-                json_string(&file.virtual_path),
-                json_string(file.kind.label()),
-                file.bytes.len(),
-                file.source_offset
-            )
-        })
+        .map(render_embedded_file_json)
         .collect::<Vec<_>>()
         .join(",");
 
@@ -272,7 +264,8 @@ fn render_embedded_manifest_json(inspection: &BinaryInspection) -> String {
             "{{",
             "\"container\":{{",
             "\"name\":{},\"file_offset\":{},\"headerless_offset\":{},\"section_size\":{},",
-            "\"graph_file_offset\":{},\"graph_size\":{},\"entry_point\":{}",
+            "\"graph_file_offset\":{},\"graph_size\":{},\"standalone_layout\":{},",
+            "\"standalone_record_size\":{},\"bun_version_hint\":{},\"entry_point\":{}",
             "}},",
             "\"metadata\":{{{}}},",
             "\"files_dir\":\"files\",",
@@ -288,6 +281,9 @@ fn render_embedded_manifest_json(inspection: &BinaryInspection) -> String {
         inspection.bun_section_bytes.len(),
         option_json_usize(inspection.standalone_graph_file_offset),
         option_json_usize(inspection.standalone_graph_bytes.as_ref().map(Vec::len)),
+        option_json_string(inspection.standalone_layout),
+        option_json_usize(inspection.standalone_record_size),
+        option_json_string(inspection.bun_version_hint),
         option_json_string(inspection.entry_point_path.as_deref()),
         metadata_json,
         inspection.bunfs_paths.len(),
@@ -297,8 +293,45 @@ fn render_embedded_manifest_json(inspection: &BinaryInspection) -> String {
     )
 }
 
+fn render_embedded_file_json(file: &super::embedded::EmbeddedFile) -> String {
+    let mut fields = vec![
+        json_field("path", &file.virtual_path),
+        json_field("kind", file.kind.label()),
+        json_usize_field("size", file.bytes.len()),
+        json_usize_field("source_offset", file.source_offset),
+    ];
+
+    if let Some(derived_from) = &file.derived_from {
+        fields.push(json_field("derived_from", derived_from));
+    }
+    if let Some(role) = file.standalone_role {
+        fields.push(json_field("standalone_role", role));
+    }
+    if let Some(encoding) = file.standalone_encoding {
+        fields.push(json_field("encoding", encoding));
+    }
+    if let Some(loader_id) = file.standalone_loader_id {
+        fields.push(json_usize_field("loader_id", usize::from(loader_id)));
+    }
+    if let Some(module_format) = file.standalone_module_format {
+        fields.push(json_field("module_format", module_format));
+    }
+    if let Some(side) = file.standalone_side {
+        fields.push(json_field("side", side));
+    }
+    if let Some(origin_path) = &file.standalone_bytecode_origin_path {
+        fields.push(json_field("bytecode_origin_path", origin_path));
+    }
+
+    format!("{{{}}}", fields.join(","))
+}
+
 fn json_field(name: &str, value: &str) -> String {
     format!("{}:{}", json_string(name), json_string(value))
+}
+
+fn json_usize_field(name: &str, value: usize) -> String {
+    format!("{}:{}", json_string(name), value)
 }
 
 fn json_bool_field(name: &str, value: bool) -> String {

@@ -248,9 +248,11 @@ fn render(
     source: &str,
     scoping: Option<oxc_semantic::Scoping>,
 ) -> String {
-    let mut options = CodegenOptions::default();
-    options.indent_char = IndentChar::Space;
-    options.indent_width = 2;
+    let options = CodegenOptions {
+        indent_char: IndentChar::Space,
+        indent_width: 2,
+        ..CodegenOptions::default()
+    };
 
     Codegen::new()
         .with_options(options)
