@@ -1,6 +1,6 @@
 [package]
 name = "debun"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.94"
 description = "Turn compiled Bun bundles into readable JS, split modules into files, and extract embedded Bun assets."
