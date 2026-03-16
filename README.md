@@ -23,11 +23,13 @@ By default this installs `debun` into `~/.local/bin`.
 debun --help
 ```
 
-To install into a different directory:
+Install the latest release binary in one step on Windows (PowerShell):
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/iivankin/debun/main/install.sh | DEBUN_INSTALL_DIR=/usr/local/bin bash
+```powershell
+powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/iivankin/debun/main/install.ps1 | iex"
 ```
+
+This installs `debun.exe` into `%USERPROFILE%\.local\bin` and adds that directory to your user `PATH` if needed.
 
 ## Usage
 
