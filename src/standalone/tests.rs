@@ -164,7 +164,6 @@ fn parses_appended_standalone_graph_with_extended_records() {
     assert_eq!(inspection.payload_file_offset, payload_offset);
     assert_eq!(inspection.record_layout, "extended");
     assert_eq!(inspection.record_size, MODULE_RECORD_SIZE_EXTENDED);
-    assert_eq!(inspection.bun_version_hint, Some("bun-v1.3.9+"));
     assert_eq!(inspection.files.len(), 2);
     assert_eq!(inspection.files[0].virtual_path, "/$bunfs/root/app.js");
     assert_eq!(inspection.files[1].virtual_path, "/$bunfs/root/chunk.wasm");
@@ -230,7 +229,6 @@ fn parses_appended_standalone_graph_with_module_info_records() {
 
     assert_eq!(inspection.record_layout, "with-module-info");
     assert_eq!(inspection.record_size, MODULE_RECORD_SIZE_WITH_MODULE_INFO);
-    assert_eq!(inspection.bun_version_hint, None);
     assert_eq!(
         inspection.files[0].sourcemap.as_deref(),
         Some(b"SMAP".as_slice())
@@ -284,7 +282,6 @@ fn parses_appended_standalone_graph_with_compact_records() {
     assert_eq!(inspection.payload_file_offset, payload_offset);
     assert_eq!(inspection.record_layout, "compact");
     assert_eq!(inspection.record_size, MODULE_RECORD_SIZE_COMPACT);
-    assert_eq!(inspection.bun_version_hint, None);
     assert_eq!(inspection.files.len(), 2);
     assert_eq!(inspection.files[0].virtual_path, "/$bunfs/root/app.js");
     assert_eq!(inspection.files[1].virtual_path, "/$bunfs/root/chunk.wasm");

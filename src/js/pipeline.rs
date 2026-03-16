@@ -25,10 +25,110 @@ pub(super) fn transform_source_inner(
     source: &str,
     split_modules: bool,
 ) -> Result<TransformArtifacts, Box<dyn std::error::Error>> {
-    let allocator = Allocator::default();
-    let source_type = detect_source_type(source);
+    let transformed = transform_source_best_effort(config, source)?;
 
-    let parser_return = Parser::new(&allocator, source, source_type)
+    let modules = if split_modules {
+        build_split_modules(
+            config,
+            if config.rename_symbols {
+                &transformed.renamed
+            } else {
+                &transformed.formatted
+            },
+        )?
+    } else {
+        Vec::new()
+    };
+
+    Ok(TransformArtifacts {
+        formatted: transformed.formatted,
+        renamed: transformed.renamed,
+        renames: transformed.renames,
+        parse_errors: transformed.parse_errors,
+        semantic_errors: transformed.semantic_errors,
+        modules,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParseStrategy {
+    Unambiguous,
+    CommonJs,
+}
+
+impl ParseStrategy {
+    fn source_type(self) -> SourceType {
+        match self {
+            Self::Unambiguous => SourceType::unambiguous(),
+            Self::CommonJs => SourceType::cjs(),
+        }
+    }
+
+    fn preference_rank(self) -> usize {
+        match self {
+            Self::Unambiguous => 0,
+            Self::CommonJs => 1,
+        }
+    }
+}
+
+struct CoreTransformArtifacts {
+    formatted: String,
+    renamed: String,
+    renames: Vec<super::SymbolRename>,
+    parse_errors: Vec<String>,
+    semantic_errors: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DiagnosticScore {
+    parse_errors: usize,
+    semantic_errors: usize,
+    preference_rank: usize,
+}
+
+impl CoreTransformArtifacts {
+    fn score(&self, strategy: ParseStrategy) -> DiagnosticScore {
+        DiagnosticScore {
+            parse_errors: self.parse_errors.len(),
+            semantic_errors: self.semantic_errors.len(),
+            preference_rank: strategy.preference_rank(),
+        }
+    }
+}
+
+fn transform_source_best_effort(
+    config: &Config,
+    source: &str,
+) -> Result<CoreTransformArtifacts, Box<dyn std::error::Error>> {
+    // Bun standalone entrypoints often mix CommonJS wrappers with ESM-only
+    // syntax like static imports, `import.meta`, and top-level `await`.
+    // Start with Oxc's "unambiguous" mode, then fall back to explicit CJS
+    // when it produces fewer diagnostics.
+    let mut best: Option<(DiagnosticScore, CoreTransformArtifacts)> = None;
+    for strategy in [ParseStrategy::Unambiguous, ParseStrategy::CommonJs] {
+        let candidate = transform_source_for_strategy(config, source, strategy)?;
+        let score = candidate.score(strategy);
+        if best
+            .as_ref()
+            .map(|(best_score, _)| score < *best_score)
+            .unwrap_or(true)
+        {
+            best = Some((score, candidate));
+        }
+    }
+
+    best.map(|(_, candidate)| candidate)
+        .ok_or_else(|| "no parse strategy candidates were produced".into())
+}
+
+fn transform_source_for_strategy(
+    config: &Config,
+    source: &str,
+    strategy: ParseStrategy,
+) -> Result<CoreTransformArtifacts, Box<dyn std::error::Error>> {
+    let allocator = Allocator::default();
+    let parser_return = Parser::new(&allocator, source, strategy.source_type())
         .with_options(ParseOptions {
             allow_return_outside_function: true,
             parse_regular_expression: true,
@@ -63,43 +163,13 @@ pub(super) fn transform_source_inner(
     };
     let renamed = render(&program, source, Some(scoping));
 
-    let modules = if split_modules {
-        build_split_modules(
-            config,
-            if config.rename_symbols {
-                &renamed
-            } else {
-                &formatted
-            },
-        )?
-    } else {
-        Vec::new()
-    };
-
-    Ok(TransformArtifacts {
+    Ok(CoreTransformArtifacts {
         formatted,
         renamed,
         renames,
         parse_errors,
         semantic_errors,
-        modules,
     })
-}
-
-fn detect_source_type(source: &str) -> SourceType {
-    let trimmed = source.trim_start();
-    let looks_like_module = trimmed.starts_with("import ")
-        || trimmed.starts_with("export ")
-        || source.contains("\nimport ")
-        || source.contains("\nexport ")
-        || source.contains("// @bun\nimport")
-        || source.contains("// @bun\r\nimport");
-
-    if looks_like_module {
-        SourceType::mjs()
-    } else {
-        SourceType::cjs()
-    }
 }
 
 fn build_split_modules(
@@ -232,4 +302,47 @@ fn render(
         .with_scoping(scoping)
         .build(program)
         .code
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::transform_source_inner;
+    use crate::args::Config;
+
+    fn test_config() -> Config {
+        Config {
+            input: PathBuf::from("input.js"),
+            out_dir: PathBuf::from("out"),
+            module_name: "bundle".to_string(),
+            rename_symbols: false,
+        }
+    }
+
+    #[test]
+    fn picks_module_goal_for_top_level_await() {
+        let artifacts = transform_source_inner(&test_config(), "await boot();", false).unwrap();
+
+        assert!(artifacts.parse_errors.is_empty());
+        assert!(artifacts.semantic_errors.is_empty());
+    }
+
+    #[test]
+    fn picks_module_goal_for_import_meta() {
+        let artifacts =
+            transform_source_inner(&test_config(), "console.log(import.meta.url);", false).unwrap();
+
+        assert!(artifacts.parse_errors.is_empty());
+        assert!(artifacts.semantic_errors.is_empty());
+    }
+
+    #[test]
+    fn picks_module_goal_for_compact_esm_syntax() {
+        let source = r#"var x = 1;import{readFile}from"fs";await readFile("foo");console.log(x);"#;
+        let artifacts = transform_source_inner(&test_config(), source, false).unwrap();
+
+        assert!(artifacts.parse_errors.is_empty());
+        assert!(artifacts.semantic_errors.is_empty());
+    }
 }

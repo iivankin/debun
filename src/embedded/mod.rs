@@ -8,6 +8,7 @@ mod raw;
 mod structured;
 #[cfg(test)]
 mod tests;
+mod version;
 
 use metadata::collect_metadata;
 use raw::{
@@ -15,6 +16,7 @@ use raw::{
     printable_strings,
 };
 use structured::structured_embedded_files;
+use version::detect_bun_version;
 
 const MACH_O_MAGIC_64: u32 = 0xfeedfacf;
 const MACH_O_MAGIC_32: u32 = 0xfeedface;
@@ -40,7 +42,7 @@ pub struct BinaryInspection {
     pub standalone_graph_bytes: Option<Vec<u8>>,
     pub standalone_layout: Option<&'static str>,
     pub standalone_record_size: Option<usize>,
-    pub bun_version_hint: Option<&'static str>,
+    pub bun_version: Option<String>,
     pub bunfs_paths: Vec<String>,
     pub metadata: Vec<(String, String)>,
     pub files: Vec<EmbeddedFile>,
@@ -106,6 +108,8 @@ pub fn inspect_binary(path: &Path) -> Result<Option<BinaryInspection>, Box<dyn E
 }
 
 fn inspect_binary_bytes(bytes: &[u8]) -> Result<Option<BinaryInspection>, Box<dyn Error>> {
+    let bun_version = detect_bun_version(bytes);
+
     if let Some(standalone) = inspect_executable(bytes)? {
         let raw_container_bytes = standalone.raw_container_bytes.clone();
         let payload_bytes = standalone.payload_bytes.clone();
@@ -137,7 +141,7 @@ fn inspect_binary_bytes(bytes: &[u8]) -> Result<Option<BinaryInspection>, Box<dy
             standalone_graph_bytes: Some(payload_bytes),
             standalone_layout: Some(standalone.record_layout),
             standalone_record_size: Some(standalone.record_size),
-            bun_version_hint: standalone.bun_version_hint,
+            bun_version,
             bunfs_paths,
             metadata,
             files: if structured_files.is_empty() {
@@ -177,7 +181,7 @@ fn inspect_binary_bytes(bytes: &[u8]) -> Result<Option<BinaryInspection>, Box<dy
         standalone_graph_bytes: None,
         standalone_layout: None,
         standalone_record_size: None,
-        bun_version_hint: None,
+        bun_version,
         bunfs_paths,
         metadata,
         files,

@@ -30,18 +30,6 @@ impl ModuleRecordLayout {
             Self::Extended => "extended",
         }
     }
-
-    const fn bun_version_hint(self) -> Option<&'static str> {
-        // Record size alone is not enough to identify Bun reliably.
-        // `compact` has been observed across multiple releases, including at
-        // least one real-world Bun 1.3.10 binary, so only emit a version hint
-        // when the layout is unique in the official release tags we checked.
-        match self {
-            Self::Compact => None,
-            Self::WithModuleInfo => None,
-            Self::Extended => Some("bun-v1.3.9+"),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +122,6 @@ pub(super) fn parse_payload(
         payload_bytes: payload.payload_bytes.to_vec(),
         record_layout: record_layout.label(),
         record_size: record_layout.size(),
-        bun_version_hint: record_layout.bun_version_hint(),
         files,
         entry_point_path,
         entry_point_source,

@@ -34,7 +34,6 @@ pub struct StandaloneInspection {
     pub payload_bytes: Vec<u8>,
     pub record_layout: &'static str,
     pub record_size: usize,
-    pub bun_version_hint: Option<&'static str>,
     pub files: Vec<StandaloneFile>,
     pub entry_point_path: Option<String>,
     pub entry_point_source: Option<String>,

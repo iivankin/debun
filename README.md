@@ -71,7 +71,7 @@ Important files:
 - `summary.json`: machine-friendly overview of the generated workspace and the first useful artifact to inspect
 - `symbols.txt`: old symbol -> new symbol mapping, only when renaming produced one
 - `modules/`: split CJS/lazy-init modules when the source is a single wrapped bundle
-- `embedded/manifest.json`: machine-friendly inventory of extracted embedded files, entrypoint, standalone layout/version hint, and recovered metadata
+- `embedded/manifest.json`: machine-friendly inventory of extracted embedded files, entrypoint, standalone layout/Bun version, and recovered metadata
 - `embedded/files/`: recovered BunFS file tree plus raw/decoded standalone sourcemap and `module_info` sidecars when Bun stored them
 
 ## What Works Well
