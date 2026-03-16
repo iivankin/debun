@@ -1,0 +1,16 @@
+[package]
+name = "debun"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Turn compiled Bun bundles into readable JS, split modules into files, and extract embedded Bun assets."
+
+[dependencies]
+oxc_allocator = "=0.119.0"
+oxc_ast = "=0.119.0"
+oxc_ast_visit = "=0.119.0"
+oxc_codegen = "=0.119.0"
+oxc_parser = "=0.119.0"
+oxc_semantic = "=0.119.0"
+oxc_span = "=0.119.0"
+oxc_syntax = "=0.119.0"
