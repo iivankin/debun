@@ -18,6 +18,7 @@ pub(super) fn render_summary_json(
         json_field("input", &config.input.display().to_string()),
         json_field("module_name", &config.module_name),
         json_bool_field("rename_enabled", config.rename_symbols),
+        json_bool_field("unbundle_enabled", config.unbundle),
         format!(
             "\"source\":{{\"trimmed_prefix\":{},\"trimmed_suffix\":{},\"had_nul_terminator\":{}}}",
             extracted.trimmed_prefix,
@@ -37,7 +38,7 @@ pub(super) fn render_summary_json(
             embedded_files
         ),
         format!(
-            "\"outputs\":{{\"primary\":{},\"symbols\":{},\"modules_dir\":{},\"modules_index\":{},\"embedded_manifest\":{},\"warnings\":{}}}",
+            "\"outputs\":{{\"primary\":{},\"symbols\":{},\"modules_dir\":{},\"modules_index\":{},\"embedded_manifest\":{},\"pack_support\":{},\"warnings\":{}}}",
             option_json_string(outputs.primary_output.as_deref()),
             option_json_string(outputs.wrote_symbols.then_some("symbols.txt")),
             option_json_string(outputs.wrote_modules.then_some("modules")),
@@ -47,6 +48,7 @@ pub(super) fn render_summary_json(
                     .wrote_embedded_manifest
                     .then_some("embedded/manifest.json")
             ),
+            option_json_string(outputs.wrote_pack_support.then_some(".debun")),
             option_json_string(outputs.wrote_warnings.then_some("warnings.txt"))
         ),
     ];

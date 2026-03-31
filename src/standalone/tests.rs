@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+
 use super::{
     MODULE_RECORD_SIZE_COMPACT, MODULE_RECORD_SIZE_EXTENDED, MODULE_RECORD_SIZE_WITH_MODULE_INFO,
-    OFFSETS_SIZE_64, STRING_POINTER_SIZE, TRAILER, inspect_executable,
+    OFFSETS_SIZE_64, ReplacementParts, STRING_POINTER_SIZE, TRAILER, inspect_executable,
+    repack_executable,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -302,4 +305,77 @@ fn parses_appended_standalone_graph_with_compact_records() {
         Some(b"BYTE".as_slice())
     );
     assert_eq!(inspection.files[0].module_info, None);
+}
+
+#[test]
+fn repacks_appended_standalone_graph_with_replacements() {
+    let payload = build_payload(
+        &[
+            TestModule {
+                name: "/$bunfs/root/app.js",
+                contents: b"// @bun\nconsole.log('entry');\n",
+                sourcemap: b"SMAP",
+                bytecode: b"BYTE",
+                module_info: b"META",
+                bytecode_origin_path: Some("B:/~BUN/root/app.js"),
+            },
+            TestModule {
+                name: "B:/~BUN/root/chunk.wasm",
+                contents: b"\0asm\x01\0\0\0",
+                sourcemap: b"",
+                bytecode: b"",
+                module_info: b"",
+                bytecode_origin_path: None,
+            },
+        ],
+        0,
+        TestModuleRecordLayout::Extended,
+    );
+
+    let mut exe = vec![0x7f, b'E', b'L', b'F'];
+    exe.resize(128, 0);
+    exe.extend_from_slice(&payload);
+    exe.extend_from_slice(&(exe.len() as u64 + 8).to_le_bytes());
+
+    let inspection = inspect_executable(&exe)
+        .expect("parser should not fail")
+        .expect("parser should find an appended payload");
+
+    let mut replacements = HashMap::new();
+    replacements.insert(
+        "/$bunfs/root/app.js".to_string(),
+        ReplacementParts {
+            contents: Some(b"// @bun\nconsole.log('patched');\n".to_vec()),
+            sourcemap: Some(b"NEW-SMAP".to_vec()),
+            bytecode: None,
+            module_info: Some(b"NEW-META".to_vec()),
+        },
+    );
+
+    let repacked =
+        repack_executable(&exe, inspection, &replacements).expect("repack should succeed");
+    let patched = inspect_executable(&repacked.bytes)
+        .expect("parser should not fail")
+        .expect("parser should find the repacked payload");
+
+    assert_eq!(repacked.replaced_contents, 1);
+    assert_eq!(repacked.replaced_sourcemaps, 1);
+    assert_eq!(repacked.replaced_bytecodes, 0);
+    assert_eq!(repacked.replaced_module_infos, 1);
+    assert_eq!(
+        patched.entry_point_source.as_deref(),
+        Some("// @bun\nconsole.log('patched');\n")
+    );
+    assert_eq!(
+        patched.files[0].sourcemap.as_deref(),
+        Some(b"NEW-SMAP".as_slice())
+    );
+    assert_eq!(
+        patched.files[0].bytecode.as_deref(),
+        Some(b"BYTE".as_slice())
+    );
+    assert_eq!(
+        patched.files[0].module_info.as_deref(),
+        Some(b"NEW-META".as_slice())
+    );
 }

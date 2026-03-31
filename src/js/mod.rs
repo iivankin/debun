@@ -29,5 +29,5 @@ pub fn transform_source(
     config: &Config,
     source: &str,
 ) -> Result<TransformArtifacts, Box<dyn std::error::Error>> {
-    pipeline::transform_source_inner(config, source, true)
+    pipeline::transform_source_inner(config, source, config.unbundle)
 }

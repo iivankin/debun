@@ -3,6 +3,8 @@ mod embedded;
 mod extract;
 mod js;
 mod output;
+mod pack;
+mod pack_support;
 mod rewrite;
 mod split;
 mod standalone;
@@ -10,13 +12,21 @@ mod standalone_decode;
 
 use std::{error::Error, fs};
 
-use args::Config;
+use args::{Command, Config, PackConfig};
 use embedded::inspect_binary;
 use extract::ExtractedSource;
 use js::transform_source;
 use output::write_outputs;
+use pack::pack_binary;
 
-pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
+pub fn run(command: Command) -> Result<(), Box<dyn Error>> {
+    match command {
+        Command::Unpack(config) => run_unpack(config),
+        Command::Pack(config) => run_pack(config),
+    }
+}
+
+fn run_unpack(config: Config) -> Result<(), Box<dyn Error>> {
     print_header(&config);
 
     print_phase(1, 3, "inspect");
@@ -53,6 +63,9 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     if output_summary.wrote_embedded_manifest {
         print_detail("manifest", "embedded/manifest.json");
     }
+    if output_summary.wrote_pack_support {
+        print_detail("pack", ".debun");
+    }
     if let Some(inspection) = &inspection {
         print_detail("files", inspection.files.len());
     }
@@ -68,6 +81,33 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             "semantic",
             format!("{} warnings", artifacts.semantic_errors.len()),
         );
+    }
+
+    Ok(())
+}
+
+fn run_pack(config: PackConfig) -> Result<(), Box<dyn Error>> {
+    println!("debun");
+    print_detail("from", config.from_dir.display());
+    print_detail("output", config.out_file.display());
+    println!();
+
+    print_phase(1, 2, "pack");
+    let summary = pack_binary(&config)?;
+
+    println!();
+    println!("done");
+    print_detail("output", config.out_file.display());
+    print_detail("root", summary.replacements_root.display());
+    print_detail("contents", summary.replaced_contents);
+    if summary.replaced_sourcemaps > 0 {
+        print_detail("sourcemaps", summary.replaced_sourcemaps);
+    }
+    if summary.replaced_bytecodes > 0 {
+        print_detail("bytecode", summary.replaced_bytecodes);
+    }
+    if summary.replaced_module_infos > 0 {
+        print_detail("module-info", summary.replaced_module_infos);
     }
 
     Ok(())

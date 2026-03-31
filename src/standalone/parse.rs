@@ -1,36 +1,10 @@
 use std::error::Error;
 
 use super::{
-    BUNFS_ROOT_PREFIX, MODULE_RECORD_SIZE_COMPACT, MODULE_RECORD_SIZE_EXTENDED,
-    MODULE_RECORD_SIZE_WITH_MODULE_INFO, RawStringPointer, STRING_POINTER_SIZE, TRAILER,
-    WINDOWS_BUNFS_ROOT_PREFIX, parse_offsets, parse_string_pointer,
+    BUNFS_ROOT_PREFIX, ModuleRecordLayout, RawStringPointer, STRING_POINTER_SIZE, StandaloneModule,
+    TRAILER, WINDOWS_BUNFS_ROOT_PREFIX, parse_offsets, parse_string_pointer,
 };
 use crate::standalone::{StandaloneFile, StandaloneInspection, container::ContainerPayload};
-
-#[derive(Debug, Clone, Copy)]
-enum ModuleRecordLayout {
-    Compact,
-    WithModuleInfo,
-    Extended,
-}
-
-impl ModuleRecordLayout {
-    const fn size(self) -> usize {
-        match self {
-            Self::Compact => MODULE_RECORD_SIZE_COMPACT,
-            Self::WithModuleInfo => MODULE_RECORD_SIZE_WITH_MODULE_INFO,
-            Self::Extended => MODULE_RECORD_SIZE_EXTENDED,
-        }
-    }
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Compact => "compact",
-            Self::WithModuleInfo => "with-module-info",
-            Self::Extended => "extended",
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 struct ParsedModuleRecord {
@@ -74,8 +48,11 @@ pub(super) fn parse_payload(
         .ok_or("standalone payload module list pointer was out of bounds")?;
     let (record_layout, records) =
         parse_module_records(body, modules_bytes, offsets.entry_point_id)?;
+    let compile_exec_argv =
+        slice_optional_pointer(body, offsets._compile_exec_argv_ptr).map(<[u8]>::to_vec);
 
     let mut files = Vec::new();
+    let mut modules = Vec::with_capacity(records.len());
     let mut entry_point_path = None;
     let mut entry_point_source = None;
 
@@ -92,11 +69,8 @@ pub(super) fn parse_payload(
             }
         }
 
-        if !is_bunfs_virtual_path(&record.name) {
-            continue;
-        }
-
-        files.push(StandaloneFile {
+        let module = StandaloneModule {
+            original_path: record.name.clone(),
             virtual_path: normalized_path,
             source_offset: record.contents_ptr.offset as usize,
             bytes: contents_bytes.to_vec(),
@@ -111,7 +85,28 @@ pub(super) fn parse_payload(
             loader: record.loader,
             module_format: record.module_format,
             side: record.side,
-        });
+        };
+
+        if is_bunfs_virtual_path(&record.name) {
+            files.push(StandaloneFile {
+                virtual_path: module.virtual_path.clone(),
+                source_offset: module.source_offset,
+                bytes: module.bytes.clone(),
+                sourcemap: module.sourcemap.clone(),
+                sourcemap_offset: module.sourcemap_offset,
+                bytecode: module.bytecode.clone(),
+                bytecode_offset: module.bytecode_offset,
+                module_info: module.module_info.clone(),
+                module_info_offset: module.module_info_offset,
+                bytecode_origin_path: module.bytecode_origin_path.clone(),
+                encoding: module.encoding,
+                loader: module.loader,
+                module_format: module.module_format,
+                side: module.side,
+            });
+        }
+
+        modules.push(module);
     }
 
     Ok(StandaloneInspection {
@@ -125,6 +120,11 @@ pub(super) fn parse_payload(
         files,
         entry_point_path,
         entry_point_source,
+        entry_point_id: offsets.entry_point_id,
+        compile_exec_argv,
+        flags_bits: offsets._flags_bits,
+        record_layout_kind: record_layout,
+        modules,
     })
 }
 

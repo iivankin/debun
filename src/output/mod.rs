@@ -5,6 +5,7 @@ use super::{
     embedded::BinaryInspection,
     extract::ExtractedSource,
     js::{TransformArtifacts, symbols_report},
+    pack_support::{base_executable_path, original_path_path, support_dir},
     split::modules_report,
 };
 
@@ -19,6 +20,7 @@ pub struct OutputSummary {
     pub wrote_symbols: bool,
     pub wrote_modules: bool,
     pub wrote_embedded_manifest: bool,
+    pub wrote_pack_support: bool,
     pub wrote_warnings: bool,
 }
 
@@ -72,6 +74,7 @@ pub fn write_outputs(
     };
 
     let wrote_embedded_manifest = write_embedded_outputs(config, inspection)?;
+    let wrote_pack_support = write_pack_support(config, inspection)?;
 
     let wrote_warnings =
         if !artifacts.parse_errors.is_empty() || !artifacts.semantic_errors.is_empty() {
@@ -120,6 +123,7 @@ pub fn write_outputs(
                 wrote_symbols,
                 wrote_modules,
                 wrote_embedded_manifest,
+                wrote_pack_support,
                 wrote_warnings,
             },
         ),
@@ -130,6 +134,7 @@ pub fn write_outputs(
         wrote_symbols,
         wrote_modules,
         wrote_embedded_manifest,
+        wrote_pack_support,
         wrote_warnings,
     })
 }
@@ -178,4 +183,36 @@ fn write_embedded_outputs(
     } else {
         Ok(false)
     }
+}
+
+fn write_pack_support(
+    config: &Config,
+    inspection: Option<&BinaryInspection>,
+) -> Result<bool, Box<dyn Error>> {
+    let support_dir = support_dir(&config.out_dir);
+    let supports_repack = inspection
+        .and_then(|value| value.standalone_graph_bytes.as_ref())
+        .is_some();
+
+    if !supports_repack {
+        if support_dir.exists() {
+            fs::remove_dir_all(&support_dir)?;
+        }
+        return Ok(false);
+    }
+
+    if support_dir.exists() {
+        fs::remove_dir_all(&support_dir)?;
+    }
+    fs::create_dir_all(&support_dir)?;
+
+    let base_path = base_executable_path(&config.out_dir);
+    fs::copy(&config.input, &base_path)?;
+    fs::set_permissions(&base_path, fs::metadata(&config.input)?.permissions())?;
+    write_file(
+        original_path_path(&config.out_dir),
+        &format!("{}\n", config.input.display()),
+    )?;
+
+    Ok(true)
 }

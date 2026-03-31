@@ -317,6 +317,7 @@ mod tests {
             out_dir: PathBuf::from("out"),
             module_name: "bundle".to_string(),
             rename_symbols: false,
+            unbundle: false,
         }
     }
 

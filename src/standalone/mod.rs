@@ -1,9 +1,10 @@
-use std::error::Error;
+use std::{collections::HashMap, error::Error};
 
 mod container;
 mod parse;
 #[cfg(test)]
 mod tests;
+mod write;
 
 const MACH_O_MAGIC_64: u32 = 0xfeedfacf;
 const MACH_O_MAGIC_32: u32 = 0xfeedface;
@@ -37,6 +38,11 @@ pub struct StandaloneInspection {
     pub files: Vec<StandaloneFile>,
     pub entry_point_path: Option<String>,
     pub entry_point_source: Option<String>,
+    pub(crate) entry_point_id: u32,
+    pub(crate) compile_exec_argv: Option<Vec<u8>>,
+    pub(crate) flags_bits: u32,
+    pub(crate) record_layout_kind: ModuleRecordLayout,
+    pub(crate) modules: Vec<StandaloneModule>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +61,67 @@ pub struct StandaloneFile {
     pub loader: u8,
     pub module_format: u8,
     pub side: u8,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StandaloneModule {
+    pub original_path: String,
+    pub virtual_path: String,
+    pub source_offset: usize,
+    pub bytes: Vec<u8>,
+    pub sourcemap: Option<Vec<u8>>,
+    pub sourcemap_offset: Option<usize>,
+    pub bytecode: Option<Vec<u8>>,
+    pub bytecode_offset: Option<usize>,
+    pub module_info: Option<Vec<u8>>,
+    pub module_info_offset: Option<usize>,
+    pub bytecode_origin_path: Option<String>,
+    pub encoding: u8,
+    pub loader: u8,
+    pub module_format: u8,
+    pub side: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ModuleRecordLayout {
+    Compact,
+    WithModuleInfo,
+    Extended,
+}
+
+impl ModuleRecordLayout {
+    pub(crate) const fn size(self) -> usize {
+        match self {
+            Self::Compact => MODULE_RECORD_SIZE_COMPACT,
+            Self::WithModuleInfo => MODULE_RECORD_SIZE_WITH_MODULE_INFO,
+            Self::Extended => MODULE_RECORD_SIZE_EXTENDED,
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::WithModuleInfo => "with-module-info",
+            Self::Extended => "extended",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReplacementParts {
+    pub contents: Option<Vec<u8>>,
+    pub sourcemap: Option<Vec<u8>>,
+    pub bytecode: Option<Vec<u8>>,
+    pub module_info: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepackedExecutable {
+    pub bytes: Vec<u8>,
+    pub replaced_contents: usize,
+    pub replaced_sourcemaps: usize,
+    pub replaced_bytecodes: usize,
+    pub replaced_module_infos: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -78,6 +145,14 @@ pub fn inspect_executable(bytes: &[u8]) -> Result<Option<StandaloneInspection>, 
     };
 
     Ok(Some(parse::parse_payload(payload)?))
+}
+
+pub fn repack_executable(
+    original_bytes: &[u8],
+    inspection: StandaloneInspection,
+    replacements: &HashMap<String, ReplacementParts>,
+) -> Result<RepackedExecutable, Box<dyn Error>> {
+    write::repack_executable(original_bytes, inspection, replacements)
 }
 
 fn parse_string_pointer(bytes: &[u8]) -> Option<RawStringPointer> {

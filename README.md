@@ -7,7 +7,8 @@ It can:
 - carve out embedded BunFS files like `index.js`, `chunk-*.js`, `html`, `css`, `png`, `txt`, `wasm`, and native `.node` blobs
 - format JS with Oxc
 - deterministically rename minified locals
-- split CommonJS and lazy-init bundles into separate files when the input is a single wrapped bundle
+- split CommonJS and lazy-init bundles into separate files when the input is a single wrapped bundle and `--unbundle` is enabled
+- pack edited extracted BunFS files back into a Bun standalone binary
 
 ## Install
 
@@ -44,12 +45,15 @@ Examples:
 ```bash
 debun ./app-binary --out-dir ./out/app
 debun ./bundle.js --out-dir ./out/bundle
+debun ./bundle.js --out-dir ./out/bundle --unbundle
+debun pack ./out/app --out ./app-binary.repacked
 ```
 
 Available flags:
 
 ```bash
-debun <input> [--out-dir <dir>] [--module-name <name>] [--no-rename]
+debun <input> [--out-dir <dir>] [--module-name <name>] [--no-rename] [--unbundle]
+debun pack [<dir>] [--out <file>]
 ```
 
 ## Output
@@ -70,9 +74,27 @@ output/
 Important files:
 - `summary.json`: machine-friendly overview of the generated workspace and the first useful artifact to inspect
 - `symbols.txt`: old symbol -> new symbol mapping, only when renaming produced one
-- `modules/`: split CJS/lazy-init modules when the source is a single wrapped bundle
+- `modules/`: split CJS/lazy-init modules when the source is a single wrapped bundle and `--unbundle` is enabled
 - `embedded/manifest.json`: machine-friendly inventory of extracted embedded files, entrypoint, standalone layout/Bun version, and recovered metadata
 - `embedded/files/`: recovered BunFS file tree plus raw/decoded standalone sourcemap and `module_info` sidecars when Bun stored them
+
+## Repack
+
+Use `pack` to rebuild a Bun standalone executable from edited extracted files:
+
+```bash
+debun pack ./out/app --out ./app-binary.repacked
+```
+
+`unpack` saves repack support under `<out>/.debun/`, including the original standalone executable as a local base.
+
+`pack` reads replacements from the first matching directory:
+- `<dir>/embedded/files`
+- `<dir>/files`
+- `<dir>` itself
+
+`pack` supports Bun standalone executables. It uses the saved base executable from `.debun/` and swaps only the embedded standalone payload.
+On macOS the packed output is re-signed ad-hoc automatically, because mutating the Mach-O bytes invalidates the original embedded signature.
 
 ## What Works Well
 
@@ -97,6 +119,7 @@ Local verification:
 ```bash
 cargo fmt --all
 cargo check
+cargo test
 cargo build --release
 ```
 
