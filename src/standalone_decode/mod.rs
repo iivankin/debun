@@ -1,4 +1,3 @@
-mod json;
 mod module_info;
 mod sourcemap;
 

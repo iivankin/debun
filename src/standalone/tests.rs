@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 
-use super::{
+use super::layout::{
     MODULE_RECORD_SIZE_COMPACT, MODULE_RECORD_SIZE_EXTENDED, MODULE_RECORD_SIZE_WITH_MODULE_INFO,
-    OFFSETS_SIZE_64, ReplacementParts, STRING_POINTER_SIZE, TRAILER, inspect_executable,
-    repack_executable,
 };
+use super::{OFFSETS_SIZE_64, ReplacementParts, TRAILER, inspect_executable, repack_executable};
 
 #[derive(Debug, Clone, Copy)]
 struct TestModule<'a> {
@@ -44,9 +43,9 @@ impl TestModuleRecordLayout {
 }
 
 fn push_bytes(body: &mut Vec<u8>, bytes: &[u8]) -> (u32, u32) {
-    let offset = body.len() as u32;
+    let offset = to_u32(body.len());
     body.extend_from_slice(bytes);
-    (offset, bytes.len() as u32)
+    (offset, to_u32(bytes.len()))
 }
 
 fn push_string_pointer(out: &mut Vec<u8>, offset: u32, length: u32) {
@@ -76,6 +75,26 @@ fn push_module_record(
     }
     out.extend_from_slice(&[1, 1, 1, 0]);
     assert_eq!(out.len() % layout.size(), 0);
+}
+
+fn to_u32(value: usize) -> u32 {
+    u32::try_from(value).expect("test payload exceeded u32")
+}
+
+fn to_u64(value: usize) -> u64 {
+    u64::try_from(value).expect("test payload exceeded u64")
+}
+
+fn build_appended_executable(payload: &[u8]) -> (Vec<u8>, usize) {
+    let mut exe = vec![0x7f, b'E', b'L', b'F'];
+    exe.resize(128, 0);
+    let payload_offset = exe.len();
+    exe.extend_from_slice(payload);
+    let total_size = to_u64(exe.len())
+        .checked_add(8)
+        .expect("test executable size overflowed");
+    exe.extend_from_slice(&total_size.to_le_bytes());
+    (exe, payload_offset)
 }
 
 fn build_payload(
@@ -109,23 +128,19 @@ fn build_payload(
         );
     }
 
-    let modules_offset = body.len() as u32;
+    let modules_offset = to_u32(body.len());
     body.extend_from_slice(&modules);
 
-    let byte_count = body.len() as u64;
+    let byte_count = body.len();
     let mut payload = body;
-    payload.extend_from_slice(&byte_count.to_le_bytes());
-    push_string_pointer(&mut payload, modules_offset, modules.len() as u32);
+    payload.extend_from_slice(&to_u64(byte_count).to_le_bytes());
+    push_string_pointer(&mut payload, modules_offset, to_u32(modules.len()));
     payload.extend_from_slice(&entry_point_id.to_le_bytes());
     push_string_pointer(&mut payload, 0, 0);
     payload.extend_from_slice(&0u32.to_le_bytes());
     payload.extend_from_slice(TRAILER);
 
-    assert_eq!(
-        payload.len(),
-        byte_count as usize + OFFSETS_SIZE_64 + TRAILER.len()
-    );
-    assert_eq!(STRING_POINTER_SIZE, 8);
+    assert_eq!(payload.len(), byte_count + OFFSETS_SIZE_64 + TRAILER.len());
     payload
 }
 
@@ -154,22 +169,20 @@ fn parses_appended_standalone_graph_with_extended_records() {
         TestModuleRecordLayout::Extended,
     );
 
-    let mut exe = vec![0x7f, b'E', b'L', b'F'];
-    exe.resize(128, 0);
-    let payload_offset = exe.len();
-    exe.extend_from_slice(&payload);
-    exe.extend_from_slice(&(exe.len() as u64 + 8).to_le_bytes());
+    let (exe, payload_offset) = build_appended_executable(&payload);
 
     let inspection = inspect_executable(&exe)
         .expect("parser should not fail")
         .expect("parser should find an appended payload");
+    let files = inspection.bunfs_modules().collect::<Vec<_>>();
+    let [entry, chunk] = files.as_slice() else {
+        panic!("expected two bunfs files");
+    };
 
     assert_eq!(inspection.payload_file_offset, payload_offset);
-    assert_eq!(inspection.record_layout, "extended");
-    assert_eq!(inspection.record_size, MODULE_RECORD_SIZE_EXTENDED);
-    assert_eq!(inspection.files.len(), 2);
-    assert_eq!(inspection.files[0].virtual_path, "/$bunfs/root/app.js");
-    assert_eq!(inspection.files[1].virtual_path, "/$bunfs/root/chunk.wasm");
+    assert_eq!(inspection.record_layout_label(), "extended");
+    assert_eq!(entry.virtual_path, "/$bunfs/root/app.js");
+    assert_eq!(chunk.virtual_path, "/$bunfs/root/chunk.wasm");
     assert_eq!(
         inspection.entry_point_path.as_deref(),
         Some("/$bunfs/root/app.js")
@@ -178,20 +191,11 @@ fn parses_appended_standalone_graph_with_extended_records() {
         inspection.entry_point_source.as_deref(),
         Some("// @bun\nconsole.log('entry');\n")
     );
+    assert_eq!(entry.sourcemap.as_deref(), Some(b"SMAP".as_slice()));
+    assert_eq!(entry.bytecode.as_deref(), Some(b"BYTE".as_slice()));
+    assert_eq!(entry.module_info.as_deref(), Some(b"META".as_slice()));
     assert_eq!(
-        inspection.files[0].sourcemap.as_deref(),
-        Some(b"SMAP".as_slice())
-    );
-    assert_eq!(
-        inspection.files[0].bytecode.as_deref(),
-        Some(b"BYTE".as_slice())
-    );
-    assert_eq!(
-        inspection.files[0].module_info.as_deref(),
-        Some(b"META".as_slice())
-    );
-    assert_eq!(
-        inspection.files[0].bytecode_origin_path.as_deref(),
+        entry.bytecode_origin_path.as_deref(),
         Some("B:/~BUN/root/app.js")
     );
 }
@@ -221,30 +225,21 @@ fn parses_appended_standalone_graph_with_module_info_records() {
         TestModuleRecordLayout::WithModuleInfo,
     );
 
-    let mut exe = vec![0x7f, b'E', b'L', b'F'];
-    exe.resize(128, 0);
-    exe.extend_from_slice(&payload);
-    exe.extend_from_slice(&(exe.len() as u64 + 8).to_le_bytes());
+    let (exe, _) = build_appended_executable(&payload);
 
     let inspection = inspect_executable(&exe)
         .expect("parser should not fail")
         .expect("parser should find an appended payload");
+    let files = inspection.bunfs_modules().collect::<Vec<_>>();
+    let [entry, ..] = files.as_slice() else {
+        panic!("expected at least one bunfs file");
+    };
 
-    assert_eq!(inspection.record_layout, "with-module-info");
-    assert_eq!(inspection.record_size, MODULE_RECORD_SIZE_WITH_MODULE_INFO);
-    assert_eq!(
-        inspection.files[0].sourcemap.as_deref(),
-        Some(b"SMAP".as_slice())
-    );
-    assert_eq!(
-        inspection.files[0].bytecode.as_deref(),
-        Some(b"BYTE".as_slice())
-    );
-    assert_eq!(
-        inspection.files[0].module_info.as_deref(),
-        Some(b"META".as_slice())
-    );
-    assert_eq!(inspection.files[0].bytecode_origin_path, None);
+    assert_eq!(inspection.record_layout_label(), "with-module-info");
+    assert_eq!(entry.sourcemap.as_deref(), Some(b"SMAP".as_slice()));
+    assert_eq!(entry.bytecode.as_deref(), Some(b"BYTE".as_slice()));
+    assert_eq!(entry.module_info.as_deref(), Some(b"META".as_slice()));
+    assert_eq!(entry.bytecode_origin_path, None);
 }
 
 #[test]
@@ -272,22 +267,20 @@ fn parses_appended_standalone_graph_with_compact_records() {
         TestModuleRecordLayout::Compact,
     );
 
-    let mut exe = vec![0x7f, b'E', b'L', b'F'];
-    exe.resize(128, 0);
-    let payload_offset = exe.len();
-    exe.extend_from_slice(&payload);
-    exe.extend_from_slice(&(exe.len() as u64 + 8).to_le_bytes());
+    let (exe, payload_offset) = build_appended_executable(&payload);
 
     let inspection = inspect_executable(&exe)
         .expect("parser should not fail")
         .expect("parser should find an appended payload");
+    let files = inspection.bunfs_modules().collect::<Vec<_>>();
+    let [entry, chunk] = files.as_slice() else {
+        panic!("expected two bunfs files");
+    };
 
     assert_eq!(inspection.payload_file_offset, payload_offset);
-    assert_eq!(inspection.record_layout, "compact");
-    assert_eq!(inspection.record_size, MODULE_RECORD_SIZE_COMPACT);
-    assert_eq!(inspection.files.len(), 2);
-    assert_eq!(inspection.files[0].virtual_path, "/$bunfs/root/app.js");
-    assert_eq!(inspection.files[1].virtual_path, "/$bunfs/root/chunk.wasm");
+    assert_eq!(inspection.record_layout_label(), "compact");
+    assert_eq!(entry.virtual_path, "/$bunfs/root/app.js");
+    assert_eq!(chunk.virtual_path, "/$bunfs/root/chunk.wasm");
     assert_eq!(
         inspection.entry_point_path.as_deref(),
         Some("/$bunfs/root/app.js")
@@ -296,15 +289,9 @@ fn parses_appended_standalone_graph_with_compact_records() {
         inspection.entry_point_source.as_deref(),
         Some("// @bun\nconsole.log('entry');\n")
     );
-    assert_eq!(
-        inspection.files[0].sourcemap.as_deref(),
-        Some(b"SMAP".as_slice())
-    );
-    assert_eq!(
-        inspection.files[0].bytecode.as_deref(),
-        Some(b"BYTE".as_slice())
-    );
-    assert_eq!(inspection.files[0].module_info, None);
+    assert_eq!(entry.sourcemap.as_deref(), Some(b"SMAP".as_slice()));
+    assert_eq!(entry.bytecode.as_deref(), Some(b"BYTE".as_slice()));
+    assert_eq!(entry.module_info, None);
 }
 
 #[test]
@@ -332,10 +319,7 @@ fn repacks_appended_standalone_graph_with_replacements() {
         TestModuleRecordLayout::Extended,
     );
 
-    let mut exe = vec![0x7f, b'E', b'L', b'F'];
-    exe.resize(128, 0);
-    exe.extend_from_slice(&payload);
-    exe.extend_from_slice(&(exe.len() as u64 + 8).to_le_bytes());
+    let (exe, _) = build_appended_executable(&payload);
 
     let inspection = inspect_executable(&exe)
         .expect("parser should not fail")
@@ -357,25 +341,20 @@ fn repacks_appended_standalone_graph_with_replacements() {
     let patched = inspect_executable(&repacked.bytes)
         .expect("parser should not fail")
         .expect("parser should find the repacked payload");
+    let files = patched.bunfs_modules().collect::<Vec<_>>();
+    let [entry, ..] = files.as_slice() else {
+        panic!("expected at least one bunfs file");
+    };
 
-    assert_eq!(repacked.replaced_contents, 1);
-    assert_eq!(repacked.replaced_sourcemaps, 1);
-    assert_eq!(repacked.replaced_bytecodes, 0);
-    assert_eq!(repacked.replaced_module_infos, 1);
+    assert_eq!(repacked.replacement_counts.contents, 1);
+    assert_eq!(repacked.replacement_counts.sourcemaps, 1);
+    assert_eq!(repacked.replacement_counts.bytecodes, 0);
+    assert_eq!(repacked.replacement_counts.module_infos, 1);
     assert_eq!(
         patched.entry_point_source.as_deref(),
         Some("// @bun\nconsole.log('patched');\n")
     );
-    assert_eq!(
-        patched.files[0].sourcemap.as_deref(),
-        Some(b"NEW-SMAP".as_slice())
-    );
-    assert_eq!(
-        patched.files[0].bytecode.as_deref(),
-        Some(b"BYTE".as_slice())
-    );
-    assert_eq!(
-        patched.files[0].module_info.as_deref(),
-        Some(b"NEW-META".as_slice())
-    );
+    assert_eq!(entry.sourcemap.as_deref(), Some(b"NEW-SMAP".as_slice()));
+    assert_eq!(entry.bytecode.as_deref(), Some(b"BYTE".as_slice()));
+    assert_eq!(entry.module_info.as_deref(), Some(b"NEW-META".as_slice()));
 }

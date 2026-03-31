@@ -3,6 +3,8 @@ use crate::args::Config;
 mod pipeline;
 mod rename;
 mod report;
+mod transform;
+mod unbundle;
 
 pub use self::report::symbols_report;
 

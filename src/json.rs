@@ -10,11 +10,13 @@ pub(crate) fn json_field(name: &str, value: &str) -> String {
     format!("{}:{}", json_string(name), json_string(value))
 }
 
-pub(crate) fn json_bool(value: bool) -> &'static str {
+pub(crate) const fn json_bool(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
 
 pub(crate) fn json_string(value: &str) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
     for ch in value.chars() {
@@ -26,7 +28,9 @@ pub(crate) fn json_string(value: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\u{08}' => out.push_str("\\b"),
             '\u{0c}' => out.push_str("\\f"),
-            _ if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            _ if ch.is_control() => {
+                let _ = write!(out, "\\u{:04x}", ch as u32);
+            }
             _ => out.push(ch),
         }
     }

@@ -1,4 +1,4 @@
-use super::super::json::{json_bool, json_field, json_string, render_string_array};
+use crate::json::{json_bool, json_field, json_string, render_string_array};
 
 #[derive(Debug, Clone)]
 pub struct DecodedModuleInfo {

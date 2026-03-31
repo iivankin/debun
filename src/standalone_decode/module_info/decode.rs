@@ -188,7 +188,7 @@ fn decode_records(
                     import_name: resolve_string_id(record[1], strings)?,
                     local_name: resolve_string_id(record[2], strings)?,
                     type_only: true,
-                })
+                });
             }
             ModuleInfoRecordKind::ImportInfoNamespace => decoded.imports.push(DecodedImport {
                 kind: "namespace",

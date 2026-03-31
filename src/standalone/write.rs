@@ -1,13 +1,94 @@
 use std::{collections::HashMap, error::Error, mem::size_of};
 
 use super::{
-    RepackedExecutable, ReplacementParts, STRING_POINTER_SIZE, StandaloneInspection, TRAILER,
+    ModuleRecordLayout, RepackedExecutable, ReplacementCounts, ReplacementParts,
+    StandaloneInspection, StandaloneModule, TRAILER,
 };
 
 #[derive(Debug, Clone, Copy)]
 struct RawStringPointer {
     offset: u32,
     length: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedRequiredPart<'a> {
+    bytes: &'a [u8],
+    replaced: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedOptionalPart<'a> {
+    bytes: Option<&'a [u8]>,
+    replaced: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedModuleParts<'a> {
+    contents: ResolvedRequiredPart<'a>,
+    sourcemap: ResolvedOptionalPart<'a>,
+    bytecode: ResolvedOptionalPart<'a>,
+    module_info: ResolvedOptionalPart<'a>,
+}
+
+impl<'a> ResolvedRequiredPart<'a> {
+    fn resolve(replacement: Option<&'a [u8]>, original: &'a [u8]) -> Self {
+        match replacement {
+            Some(bytes) => Self {
+                bytes,
+                replaced: true,
+            },
+            None => Self {
+                bytes: original,
+                replaced: false,
+            },
+        }
+    }
+}
+
+impl<'a> ResolvedOptionalPart<'a> {
+    fn resolve(replacement: Option<&'a [u8]>, original: Option<&'a [u8]>) -> Self {
+        match replacement {
+            Some(bytes) => Self {
+                bytes: Some(bytes),
+                replaced: true,
+            },
+            None => Self {
+                bytes: original,
+                replaced: false,
+            },
+        }
+    }
+}
+
+impl<'a> ResolvedModuleParts<'a> {
+    fn new(module: &'a StandaloneModule, replacement: Option<&'a ReplacementParts>) -> Self {
+        Self {
+            contents: ResolvedRequiredPart::resolve(
+                replacement.and_then(|parts| parts.contents.as_deref()),
+                &module.bytes,
+            ),
+            sourcemap: ResolvedOptionalPart::resolve(
+                replacement.and_then(|parts| parts.sourcemap.as_deref()),
+                module.sourcemap.as_deref(),
+            ),
+            bytecode: ResolvedOptionalPart::resolve(
+                replacement.and_then(|parts| parts.bytecode.as_deref()),
+                module.bytecode.as_deref(),
+            ),
+            module_info: ResolvedOptionalPart::resolve(
+                replacement.and_then(|parts| parts.module_info.as_deref()),
+                module.module_info.as_deref(),
+            ),
+        }
+    }
+
+    fn record(self, counts: &mut ReplacementCounts) {
+        counts.contents += usize::from(self.contents.replaced);
+        counts.sourcemaps += usize::from(self.sourcemap.replaced);
+        counts.bytecodes += usize::from(self.bytecode.replaced);
+        counts.module_infos += usize::from(self.module_info.replaced);
+    }
 }
 
 pub(super) fn repack_executable(
@@ -18,82 +99,34 @@ pub(super) fn repack_executable(
     let mut body = Vec::new();
     let compile_exec_argv_ptr =
         push_optional_bytes(&mut body, inspection.compile_exec_argv.as_deref())?;
-    let mut modules = Vec::with_capacity(inspection.modules.len() * inspection.record_size);
+    let record_layout = inspection.record_layout;
+    let record_size = record_layout.size();
+    let mut modules = Vec::with_capacity(inspection.modules.len() * record_size);
 
-    let mut replaced_contents = 0;
-    let mut replaced_sourcemaps = 0;
-    let mut replaced_bytecodes = 0;
-    let mut replaced_module_infos = 0;
+    let mut replacement_counts = ReplacementCounts::default();
 
     for module in inspection.modules {
-        let replacement = replacements.get(&module.virtual_path);
-
-        let contents = replacement
-            .and_then(|value| value.contents.as_deref())
-            .unwrap_or(&module.bytes);
-        if replacement
-            .and_then(|value| value.contents.as_ref())
-            .is_some()
-        {
-            replaced_contents += 1;
-        }
-
-        let sourcemap = replacement
-            .and_then(|value| value.sourcemap.as_deref())
-            .or(module.sourcemap.as_deref());
-        if replacement
-            .and_then(|value| value.sourcemap.as_ref())
-            .is_some()
-        {
-            replaced_sourcemaps += 1;
-        }
-
-        let bytecode = replacement
-            .and_then(|value| value.bytecode.as_deref())
-            .or(module.bytecode.as_deref());
-        if replacement
-            .and_then(|value| value.bytecode.as_ref())
-            .is_some()
-        {
-            replaced_bytecodes += 1;
-        }
+        let parts = ResolvedModuleParts::new(&module, replacements.get(&module.virtual_path));
+        parts.record(&mut replacement_counts);
 
         let name_ptr = push_bytes(&mut body, module.original_path.as_bytes())?;
-        let contents_ptr = push_bytes(&mut body, contents)?;
-        let sourcemap_ptr = push_optional_bytes(&mut body, sourcemap)?;
-        let bytecode_ptr = push_optional_bytes(&mut body, bytecode)?;
+        let contents_ptr = push_bytes(&mut body, parts.contents.bytes)?;
+        let sourcemap_ptr = push_optional_bytes(&mut body, parts.sourcemap.bytes)?;
+        let bytecode_ptr = push_optional_bytes(&mut body, parts.bytecode.bytes)?;
 
         push_string_pointer(&mut modules, name_ptr);
         push_string_pointer(&mut modules, contents_ptr);
         push_string_pointer(&mut modules, sourcemap_ptr);
         push_string_pointer(&mut modules, bytecode_ptr);
 
-        match inspection.record_layout_kind {
-            super::ModuleRecordLayout::Compact => {}
-            super::ModuleRecordLayout::WithModuleInfo => {
-                let module_info = replacement
-                    .and_then(|value| value.module_info.as_deref())
-                    .or(module.module_info.as_deref());
-                if replacement
-                    .and_then(|value| value.module_info.as_ref())
-                    .is_some()
-                {
-                    replaced_module_infos += 1;
-                }
-                let module_info_ptr = push_optional_bytes(&mut body, module_info)?;
+        match record_layout {
+            ModuleRecordLayout::Compact => {}
+            ModuleRecordLayout::WithModuleInfo => {
+                let module_info_ptr = push_optional_bytes(&mut body, parts.module_info.bytes)?;
                 push_string_pointer(&mut modules, module_info_ptr);
             }
-            super::ModuleRecordLayout::Extended => {
-                let module_info = replacement
-                    .and_then(|value| value.module_info.as_deref())
-                    .or(module.module_info.as_deref());
-                if replacement
-                    .and_then(|value| value.module_info.as_ref())
-                    .is_some()
-                {
-                    replaced_module_infos += 1;
-                }
-                let module_info_ptr = push_optional_bytes(&mut body, module_info)?;
+            ModuleRecordLayout::Extended => {
+                let module_info_ptr = push_optional_bytes(&mut body, parts.module_info.bytes)?;
                 let origin_ptr = push_optional_bytes(
                     &mut body,
                     module.bytecode_origin_path.as_deref().map(str::as_bytes),
@@ -109,7 +142,7 @@ pub(super) fn repack_executable(
             module.module_format,
             module.side,
         ]);
-        debug_assert_eq!(modules.len() % inspection.record_size, 0);
+        debug_assert_eq!(modules.len() % record_size, 0);
     }
 
     let modules_offset =
@@ -145,10 +178,7 @@ pub(super) fn repack_executable(
 
     Ok(RepackedExecutable {
         bytes,
-        replaced_contents,
-        replaced_sourcemaps,
-        replaced_bytecodes,
-        replaced_module_infos,
+        replacement_counts,
     })
 }
 
@@ -242,5 +272,4 @@ fn push_optional_bytes(
 fn push_string_pointer(out: &mut Vec<u8>, pointer: RawStringPointer) {
     out.extend_from_slice(&pointer.offset.to_le_bytes());
     out.extend_from_slice(&pointer.length.to_le_bytes());
-    debug_assert_eq!(STRING_POINTER_SIZE, 8);
 }

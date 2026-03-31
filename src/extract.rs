@@ -7,7 +7,6 @@ pub struct ExtractedSource {
     pub source: String,
     pub trimmed_prefix: usize,
     pub trimmed_suffix: usize,
-    pub had_nul_terminator: bool,
 }
 
 impl ExtractedSource {
@@ -21,8 +20,11 @@ impl ExtractedSource {
             source: source.into(),
             trimmed_prefix: 0,
             trimmed_suffix: 0,
-            had_nul_terminator: false,
         }
+    }
+
+    pub const fn had_nul_terminator(&self) -> bool {
+        self.trimmed_suffix > 0
     }
 
     fn from_bytes(bytes: &[u8]) -> Result<Self, Box<dyn Error>> {
@@ -39,25 +41,18 @@ impl ExtractedSource {
             source,
             trimmed_prefix: start,
             trimmed_suffix: bytes.len().saturating_sub(end),
-            had_nul_terminator: end < bytes.len(),
         })
     }
 
     fn from_text(text: &str) -> Self {
         let (start, end) =
             find_best_slice(text.as_bytes(), BUN_JS_MARKER).unwrap_or((0, text.len()));
-        let nul_offset = if end < text.len() {
-            Some(end - start)
-        } else {
-            None
-        };
         let source = text[start..end].to_string();
 
         Self {
             source,
             trimmed_prefix: start,
             trimmed_suffix: text.len().saturating_sub(end),
-            had_nul_terminator: nul_offset.is_some(),
         }
     }
 }
@@ -74,14 +69,11 @@ fn find_best_slice(haystack: &[u8], needle: &[u8]) -> Option<(usize, usize)> {
         let end = haystack[start..]
             .iter()
             .position(|byte| *byte == 0)
-            .map(|offset| start + offset)
-            .unwrap_or(haystack.len());
+            .map_or(haystack.len(), |offset| start + offset);
 
-        let is_better = best
-            .map(|(best_start, best_end)| {
-                end.saturating_sub(start) > best_end.saturating_sub(best_start)
-            })
-            .unwrap_or(true);
+        let is_better = best.is_none_or(|(best_start, best_end)| {
+            end.saturating_sub(start) > best_end.saturating_sub(best_start)
+        });
 
         if is_better {
             best = Some((start, end));

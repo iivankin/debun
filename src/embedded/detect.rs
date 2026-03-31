@@ -1,3 +1,7 @@
+use std::path::Path;
+
+use crate::binary::{read_u32_be, read_u32_le, read_u64_le};
+
 use super::{
     EmbeddedKind, JS_MARKER, JS_MARKER_FALLBACK, LC_DYSYMTAB, LC_SEGMENT, LC_SEGMENT_64, LC_SYMTAB,
     MACH_O_MAGIC_32, MACH_O_MAGIC_64, PNG_MAGIC, WASM_MAGIC,
@@ -14,19 +18,19 @@ pub(super) fn detect_kind(path: &str, bytes: &[u8]) -> Option<EmbeddedKind> {
         return Some(EmbeddedKind::Png);
     }
 
-    if path.ends_with(".js") && is_likely_javascript(bytes) {
+    if has_extension(path, "js") && is_likely_javascript(bytes) {
         return Some(EmbeddedKind::JsWrapper);
     }
-    if path.ends_with(".html") && is_likely_html(bytes) {
+    if has_extension(path, "html") && is_likely_html(bytes) {
         return Some(EmbeddedKind::Html);
     }
-    if path.ends_with(".css") && is_likely_css(bytes) {
+    if has_extension(path, "css") && is_likely_css(bytes) {
         return Some(EmbeddedKind::Css);
     }
-    if path.ends_with(".webmanifest") && is_likely_json(bytes) {
+    if has_extension(path, "webmanifest") && is_likely_json(bytes) {
         return Some(EmbeddedKind::WebManifest);
     }
-    if path.ends_with(".txt") && is_likely_text(bytes) {
+    if has_extension(path, "txt") && is_likely_text(bytes) {
         return Some(EmbeddedKind::Text);
     }
 
@@ -71,8 +75,8 @@ pub(super) fn macho_length(bytes: &[u8]) -> Option<usize> {
         _ => return None,
     };
     let header_size = if is_64 { 32 } else { 28 };
-    let ncmds = read_u32_le(bytes, 16)? as usize;
-    let sizeofcmds = read_u32_le(bytes, 20)? as usize;
+    let ncmds = usize::try_from(read_u32_le(bytes, 16)?).ok()?;
+    let sizeofcmds = usize::try_from(read_u32_le(bytes, 20)?).ok()?;
     if bytes.len() < header_size + sizeofcmds {
         return None;
     }
@@ -81,46 +85,46 @@ pub(super) fn macho_length(bytes: &[u8]) -> Option<usize> {
     let mut max_end = header_size + sizeofcmds;
     for _ in 0..ncmds {
         let cmd = read_u32_le(bytes, cursor)?;
-        let cmdsize = read_u32_le(bytes, cursor + 4)? as usize;
+        let cmdsize = usize::try_from(read_u32_le(bytes, cursor + 4)?).ok()?;
         if cmdsize < 8 || cursor + cmdsize > bytes.len() {
             return None;
         }
 
         match cmd {
             LC_SEGMENT_64 if is_64 => {
-                let fileoff = read_u64_le(bytes, cursor + 40)? as usize;
-                let filesize = read_u64_le(bytes, cursor + 48)? as usize;
+                let fileoff = usize::try_from(read_u64_le(bytes, cursor + 40)?).ok()?;
+                let filesize = usize::try_from(read_u64_le(bytes, cursor + 48)?).ok()?;
                 max_end = max_end.max(fileoff.saturating_add(filesize));
             }
             LC_SEGMENT if !is_64 => {
-                let fileoff = read_u32_le(bytes, cursor + 32)? as usize;
-                let filesize = read_u32_le(bytes, cursor + 36)? as usize;
+                let fileoff = usize::try_from(read_u32_le(bytes, cursor + 32)?).ok()?;
+                let filesize = usize::try_from(read_u32_le(bytes, cursor + 36)?).ok()?;
                 max_end = max_end.max(fileoff.saturating_add(filesize));
             }
             LC_SYMTAB => {
-                let symoff = read_u32_le(bytes, cursor + 8)? as usize;
-                let nsyms = read_u32_le(bytes, cursor + 12)? as usize;
-                let stroff = read_u32_le(bytes, cursor + 16)? as usize;
-                let strsize = read_u32_le(bytes, cursor + 20)? as usize;
+                let symoff = usize::try_from(read_u32_le(bytes, cursor + 8)?).ok()?;
+                let nsyms = usize::try_from(read_u32_le(bytes, cursor + 12)?).ok()?;
+                let stroff = usize::try_from(read_u32_le(bytes, cursor + 16)?).ok()?;
+                let strsize = usize::try_from(read_u32_le(bytes, cursor + 20)?).ok()?;
                 let nlist_size = if is_64 { 16 } else { 12 };
                 max_end = max_end.max(symoff.saturating_add(nsyms.saturating_mul(nlist_size)));
                 max_end = max_end.max(stroff.saturating_add(strsize));
             }
             LC_DYSYMTAB => {
-                let extreloff = read_u32_le(bytes, cursor + 48)? as usize;
-                let nextrel = read_u32_le(bytes, cursor + 52)? as usize;
-                let locreloff = read_u32_le(bytes, cursor + 56)? as usize;
-                let nlocrel = read_u32_le(bytes, cursor + 60)? as usize;
-                let indirectsymoff = read_u32_le(bytes, cursor + 32)? as usize;
-                let nindirectsyms = read_u32_le(bytes, cursor + 36)? as usize;
+                let extreloff = usize::try_from(read_u32_le(bytes, cursor + 48)?).ok()?;
+                let nextrel = usize::try_from(read_u32_le(bytes, cursor + 52)?).ok()?;
+                let locreloff = usize::try_from(read_u32_le(bytes, cursor + 56)?).ok()?;
+                let nlocrel = usize::try_from(read_u32_le(bytes, cursor + 60)?).ok()?;
+                let indirectsymoff = usize::try_from(read_u32_le(bytes, cursor + 32)?).ok()?;
+                let nindirectsyms = usize::try_from(read_u32_le(bytes, cursor + 36)?).ok()?;
                 max_end =
                     max_end.max(indirectsymoff.saturating_add(nindirectsyms.saturating_mul(4)));
                 max_end = max_end.max(extreloff.saturating_add(nextrel.saturating_mul(8)));
                 max_end = max_end.max(locreloff.saturating_add(nlocrel.saturating_mul(8)));
             }
             0x1d | 0x1e | 0x26 | 0x29 | 0x2b | 0x2e | 0x33 | 0x34 => {
-                let dataoff = read_u32_le(bytes, cursor + 8)? as usize;
-                let datasize = read_u32_le(bytes, cursor + 12)? as usize;
+                let dataoff = usize::try_from(read_u32_le(bytes, cursor + 8)?).ok()?;
+                let datasize = usize::try_from(read_u32_le(bytes, cursor + 12)?).ok()?;
                 max_end = max_end.max(dataoff.saturating_add(datasize));
             }
             _ => {}
@@ -148,7 +152,8 @@ pub(super) fn wasm_length(bytes: &[u8]) -> Option<usize> {
         cursor += 1;
         let (section_len, consumed) = read_uleb128(bytes.get(cursor..)?)?;
         cursor += consumed;
-        let end = cursor.checked_add(section_len as usize)?;
+        let section_len = usize::try_from(section_len).ok()?;
+        let end = cursor.checked_add(section_len)?;
         if end > bytes.len() {
             break;
         }
@@ -174,7 +179,7 @@ pub(super) fn png_length(bytes: &[u8]) -> Option<usize> {
 
     let mut cursor = PNG_MAGIC.len();
     while cursor.checked_add(12)? <= bytes.len() {
-        let length = read_u32_be(bytes, cursor)? as usize;
+        let length = usize::try_from(read_u32_be(bytes, cursor)?).ok()?;
         let chunk_type = bytes.get(cursor + 4..cursor + 8)?;
         cursor = cursor.checked_add(8)?.checked_add(length)?.checked_add(4)?;
         if chunk_type == b"IEND" {
@@ -236,7 +241,7 @@ fn is_likely_json(bytes: &[u8]) -> bool {
         leading_text(bytes)
             .chars()
             .find(|ch| !ch.is_ascii_whitespace()),
-        Some('{') | Some('[')
+        Some('{' | '[')
     )
 }
 
@@ -259,26 +264,8 @@ fn leading_text(bytes: &[u8]) -> String {
         .to_string()
 }
 
-pub(super) fn read_fixed_string(bytes: &[u8], start: usize, len: usize) -> Option<String> {
-    let slice = bytes.get(start..start + len)?;
-    let end = slice
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(slice.len());
-    String::from_utf8(slice[..end].to_vec()).ok()
-}
-
-pub(super) fn read_u32_le(bytes: &[u8], start: usize) -> Option<u32> {
-    let slice = bytes.get(start..start + 4)?;
-    Some(u32::from_le_bytes(slice.try_into().ok()?))
-}
-
-fn read_u32_be(bytes: &[u8], start: usize) -> Option<u32> {
-    let slice = bytes.get(start..start + 4)?;
-    Some(u32::from_be_bytes(slice.try_into().ok()?))
-}
-
-pub(super) fn read_u64_le(bytes: &[u8], start: usize) -> Option<u64> {
-    let slice = bytes.get(start..start + 8)?;
-    Some(u64::from_le_bytes(slice.try_into().ok()?))
+fn has_extension(path: &str, expected: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(expected))
 }

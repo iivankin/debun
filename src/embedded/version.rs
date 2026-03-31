@@ -19,7 +19,7 @@ pub(super) fn detect_bun_version(bytes: &[u8]) -> Option<String> {
         update_best_candidate(&printable_strings(region), &mut best);
     }
 
-    best.map(format_candidate)
+    best.as_ref().map(format_candidate)
 }
 
 fn update_best_candidate(strings: &str, best: &mut Option<VersionCandidate>) {
@@ -27,13 +27,10 @@ fn update_best_candidate(strings: &str, best: &mut Option<VersionCandidate>) {
         let Some(candidate) = detect_candidate(line) else {
             continue;
         };
-        let should_replace = best
-            .as_ref()
-            .map(|best| {
-                candidate.score > best.score
-                    || (candidate.score == best.score && candidate.version > best.version)
-            })
-            .unwrap_or(true);
+        let should_replace = best.as_ref().is_none_or(|best| {
+            candidate.score > best.score
+                || (candidate.score == best.score && candidate.version > best.version)
+        });
         if should_replace {
             *best = Some(candidate);
         }
@@ -70,7 +67,7 @@ fn detect_candidate(line: &str) -> Option<VersionCandidate> {
     Some(VersionCandidate { version, score })
 }
 
-fn format_candidate(candidate: VersionCandidate) -> String {
+fn format_candidate(candidate: &VersionCandidate) -> String {
     format!(
         "bun-v{}.{}.{}",
         candidate.version.major, candidate.version.minor, candidate.version.patch

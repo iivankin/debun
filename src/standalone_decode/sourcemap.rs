@@ -3,9 +3,8 @@ use std::{
     io::{Cursor, Read},
 };
 
+use crate::json::json_string;
 use ruzstd::decoding::StreamingDecoder;
-
-use super::json::json_string;
 
 const SOURCE_MAP_HEADER_SIZE: usize = 8;
 const STRING_POINTER_SIZE: usize = 8;
@@ -159,19 +158,23 @@ mod tests {
         push_u32(out, length);
     }
 
+    fn to_u32(value: usize) -> u32 {
+        u32::try_from(value).expect("test payload exceeded u32")
+    }
+
     #[test]
     fn decodes_serialized_sourcemap_into_standard_json_shape() {
         let name = b"src/app.ts";
         let mappings = b"AAAA";
         let string_payload_start = 8 + 8 + 8 + mappings.len();
-        let name_offset = string_payload_start as u32;
-        let contents_offset = (string_payload_start + name.len()) as u32;
+        let name_offset = to_u32(string_payload_start);
+        let contents_offset = to_u32(string_payload_start + name.len());
 
         let mut raw = Vec::new();
         push_u32(&mut raw, 1);
-        push_u32(&mut raw, mappings.len() as u32);
-        push_pointer(&mut raw, name_offset, name.len() as u32);
-        push_pointer(&mut raw, contents_offset, ZSTD_CONSOLE_LOG.len() as u32);
+        push_u32(&mut raw, to_u32(mappings.len()));
+        push_pointer(&mut raw, name_offset, to_u32(name.len()));
+        push_pointer(&mut raw, contents_offset, to_u32(ZSTD_CONSOLE_LOG.len()));
         raw.extend_from_slice(mappings);
         raw.extend_from_slice(name);
         raw.extend_from_slice(ZSTD_CONSOLE_LOG);

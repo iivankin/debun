@@ -10,16 +10,16 @@ use std::process::Command as ProcessCommand;
 
 use crate::{
     args::PackConfig,
-    pack_support::base_executable_path,
-    standalone::{ReplacementParts, inspect_executable, repack_executable},
+    pack_support::{base_executable_path, workspace_candidates},
+    standalone::{
+        ReplacementCounts, ReplacementParts, StandaloneModule, StandaloneSidecarKind,
+        inspect_executable, repack_executable,
+    },
 };
 
-pub struct PackSummary {
-    pub replacements_root: PathBuf,
-    pub replaced_contents: usize,
-    pub replaced_sourcemaps: usize,
-    pub replaced_bytecodes: usize,
-    pub replaced_module_infos: usize,
+pub(crate) struct PackSummary {
+    pub(crate) replacements_root: PathBuf,
+    pub(crate) replacement_counts: ReplacementCounts,
 }
 
 pub fn pack_binary(config: &PackConfig) -> Result<PackSummary, Box<dyn Error>> {
@@ -27,11 +27,11 @@ pub fn pack_binary(config: &PackConfig) -> Result<PackSummary, Box<dyn Error>> {
     let base_executable = base_executable_path(&workspace_root);
     let original_bytes = fs::read(&base_executable)?;
     let original_permissions = fs::metadata(&base_executable)?.permissions();
-    let inspection = inspect_executable(&original_bytes)?
+    let standalone = inspect_executable(&original_bytes)?
         .ok_or("pack only supports Bun standalone executables")?;
     let replacements_root = resolve_replacements_root(&workspace_root)?;
-    let replacements = collect_replacements(&replacements_root, &inspection.files)?;
-    let repacked = repack_executable(&original_bytes, inspection, &replacements)?;
+    let replacements = collect_replacements(&replacements_root, standalone.bunfs_modules())?;
+    let repacked = repack_executable(&original_bytes, standalone, &replacements)?;
 
     if let Some(parent) = config
         .out_file
@@ -46,43 +46,42 @@ pub fn pack_binary(config: &PackConfig) -> Result<PackSummary, Box<dyn Error>> {
 
     Ok(PackSummary {
         replacements_root,
-        replaced_contents: repacked.replaced_contents,
-        replaced_sourcemaps: repacked.replaced_sourcemaps,
-        replaced_bytecodes: repacked.replaced_bytecodes,
-        replaced_module_infos: repacked.replaced_module_infos,
+        replacement_counts: repacked.replacement_counts,
     })
 }
 
-fn collect_replacements(
+fn collect_replacements<'a>(
     root: &Path,
-    files: &[crate::standalone::StandaloneFile],
+    modules: impl IntoIterator<Item = &'a StandaloneModule>,
 ) -> Result<HashMap<String, ReplacementParts>, Box<dyn Error>> {
     let mut replacements = HashMap::new();
 
-    for file in files {
-        let contents = read_if_exists(root, &file.virtual_path)?;
-        let sourcemap =
-            read_if_exists(root, &format!("{}.debun-sourcemap.bin", file.virtual_path))?;
-        let bytecode = read_if_exists(root, &format!("{}.debun-bytecode.bin", file.virtual_path))?;
+    for module in modules {
+        let contents = read_if_exists(root, &module.virtual_path)?;
+        let sourcemap = read_if_exists(
+            root,
+            &module.sidecar_path(StandaloneSidecarKind::SourceMapBinary),
+        )?;
+        let bytecode = read_if_exists(
+            root,
+            &module.sidecar_path(StandaloneSidecarKind::BytecodeBinary),
+        )?;
         let module_info = read_if_exists(
             root,
-            &format!("{}.debun-module-info.bin", file.virtual_path),
+            &module.sidecar_path(StandaloneSidecarKind::ModuleInfoBinary),
         )?;
 
-        if contents.is_none() && sourcemap.is_none() && bytecode.is_none() && module_info.is_none()
-        {
+        let replacement = ReplacementParts {
+            contents,
+            sourcemap,
+            bytecode,
+            module_info,
+        };
+        if replacement.is_empty() {
             continue;
         }
 
-        replacements.insert(
-            file.virtual_path.clone(),
-            ReplacementParts {
-                contents,
-                sourcemap,
-                bytecode,
-                module_info,
-            },
-        );
+        replacements.insert(module.virtual_path.clone(), replacement);
     }
 
     Ok(replacements)
@@ -127,17 +126,6 @@ fn resolve_pack_workspace(from_dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
         from_dir.display()
     )
     .into())
-}
-
-fn workspace_candidates(from_dir: &Path) -> impl Iterator<Item = PathBuf> {
-    let direct = from_dir.to_path_buf();
-    let parent = from_dir.parent().map(Path::to_path_buf);
-    let grandparent = from_dir
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf);
-
-    [Some(direct), parent, grandparent].into_iter().flatten()
 }
 
 fn resign_if_needed(path: &Path) -> Result<(), Box<dyn Error>> {

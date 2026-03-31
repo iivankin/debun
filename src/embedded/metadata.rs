@@ -33,12 +33,9 @@ fn find_best_quoted_value(haystack: &str, key: &str) -> Option<String> {
         };
         let score = metadata_value_score(key, &value);
         if score > 0 {
-            let should_replace = best
-                .as_ref()
-                .map(|(best_score, best_value)| {
-                    score > *best_score || (score == *best_score && value.len() < best_value.len())
-                })
-                .unwrap_or(true);
+            let should_replace = best.as_ref().is_none_or(|(best_score, best_value)| {
+                score > *best_score || (score == *best_score && value.len() < best_value.len())
+            });
             if should_replace {
                 best = Some((score, value));
             }

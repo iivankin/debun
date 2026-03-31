@@ -1,9 +1,10 @@
 use super::{EmbeddedKind, structured::structured_embedded_files};
-use crate::standalone::StandaloneFile;
+use crate::standalone::StandaloneModule;
 
 #[test]
 fn structured_standalone_files_include_sidecars() {
-    let files = structured_embedded_files(&[StandaloneFile {
+    let module = StandaloneModule {
+        original_path: "/$bunfs/root/index.js".to_string(),
         virtual_path: "/$bunfs/root/index.js".to_string(),
         source_offset: 123,
         bytes: b"// @bun\nconsole.log('entry');\n".to_vec(),
@@ -18,23 +19,26 @@ fn structured_standalone_files_include_sidecars() {
         loader: 1,
         module_format: 1,
         side: 0,
-    }]);
+    };
+    let files = structured_embedded_files([&module]);
+    let [contents, sourcemap, bytecode, module_info] = files.as_slice() else {
+        panic!("expected contents plus three standalone sidecars");
+    };
 
-    assert_eq!(files.len(), 4);
-    assert_eq!(files[0].kind, EmbeddedKind::JsWrapper);
-    assert_eq!(files[0].standalone_role, Some("contents"));
+    assert_eq!(contents.kind, EmbeddedKind::JsWrapper);
+    assert_eq!(contents.standalone_role, Some("contents"));
     assert_eq!(
-        files[0].standalone_bytecode_origin_path.as_deref(),
+        contents.standalone_bytecode_origin_path.as_deref(),
         Some("B:/~BUN/root/index.js")
     );
-    assert_eq!(files[1].kind, EmbeddedKind::StandaloneSourceMap);
+    assert_eq!(sourcemap.kind, EmbeddedKind::StandaloneSourceMap);
     assert_eq!(
-        files[1].derived_from.as_deref(),
+        sourcemap.derived_from.as_deref(),
         Some("/$bunfs/root/index.js")
     );
-    assert_eq!(files[1].source_offset, 456);
-    assert_eq!(files[2].kind, EmbeddedKind::StandaloneBytecode);
-    assert_eq!(files[2].source_offset, 789);
-    assert_eq!(files[3].kind, EmbeddedKind::StandaloneModuleInfo);
-    assert_eq!(files[3].source_offset, 999);
+    assert_eq!(sourcemap.source_offset, 456);
+    assert_eq!(bytecode.kind, EmbeddedKind::StandaloneBytecode);
+    assert_eq!(bytecode.source_offset, 789);
+    assert_eq!(module_info.kind, EmbeddedKind::StandaloneModuleInfo);
+    assert_eq!(module_info.source_offset, 999);
 }

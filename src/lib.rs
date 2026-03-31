@@ -1,7 +1,9 @@
 pub mod args;
+mod binary;
 mod embedded;
 mod extract;
 mod js;
+mod json;
 mod output;
 mod pack;
 mod pack_support;
@@ -21,20 +23,20 @@ use pack::pack_binary;
 
 pub fn run(command: Command) -> Result<(), Box<dyn Error>> {
     match command {
-        Command::Unpack(config) => run_unpack(config),
-        Command::Pack(config) => run_pack(config),
+        Command::Unpack(config) => run_unpack(&config),
+        Command::Pack(config) => run_pack(&config),
     }
 }
 
-fn run_unpack(config: Config) -> Result<(), Box<dyn Error>> {
-    print_header(&config);
+fn run_unpack(config: &Config) -> Result<(), Box<dyn Error>> {
+    print_header(config);
 
     print_phase(1, 3, "inspect");
-    let inspection = inspect_binary(&config.input)?;
-    print_inspection_details(inspection.as_ref());
+    let binary_inspection = inspect_binary(&config.input)?;
+    print_inspection_details(binary_inspection.as_ref());
 
     print_phase(2, 3, "transform");
-    let extracted = if let Some(source) = inspection
+    let extracted_source = if let Some(source) = binary_inspection
         .as_ref()
         .and_then(|inspection| inspection.entry_point_source.clone())
     {
@@ -42,72 +44,77 @@ fn run_unpack(config: Config) -> Result<(), Box<dyn Error>> {
     } else {
         ExtractedSource::from_path(&config.input)?
     };
-    let artifacts = transform_source(&config, &extracted.source)?;
+    let transform = transform_source(config, &extracted_source.source)?;
 
     print_phase(3, 3, "write");
     fs::create_dir_all(&config.out_dir)?;
-    let output_summary = write_outputs(&config, &extracted, inspection.as_ref(), &artifacts)?;
+    let written_outputs = write_outputs(
+        config,
+        &extracted_source,
+        binary_inspection.as_ref(),
+        &transform,
+    )?;
 
     println!();
     println!("done");
-    if let Some(primary_output) = &output_summary.primary_output {
+    if let Some(primary_output) = written_outputs.primary_output() {
         print_detail("primary", primary_output);
     }
-    if output_summary.wrote_symbols {
-        print_detail("symbols", "symbols.txt");
+    if let Some(symbols) = written_outputs.symbols {
+        print_detail("symbols", symbols);
     }
-    print_detail("renamed", artifacts.renames.len());
-    if output_summary.wrote_modules {
-        print_detail("modules", artifacts.modules.len());
+    print_detail("renamed", transform.renames.len());
+    if written_outputs.modules.is_some() {
+        print_detail("modules", transform.modules.len());
     }
-    if output_summary.wrote_embedded_manifest {
-        print_detail("manifest", "embedded/manifest.json");
+    if let Some(manifest) = written_outputs.embedded_manifest {
+        print_detail("manifest", manifest);
     }
-    if output_summary.wrote_pack_support {
-        print_detail("pack", ".debun");
+    if let Some(pack_support) = written_outputs.pack_support {
+        print_detail("pack", pack_support);
     }
-    if let Some(inspection) = &inspection {
+    if let Some(inspection) = &binary_inspection {
         print_detail("files", inspection.files.len());
     }
 
-    if output_summary.wrote_warnings && !artifacts.parse_errors.is_empty() {
+    if !transform.parse_errors.is_empty() {
         print_detail(
             "parse",
-            format!("{} warnings", artifacts.parse_errors.len()),
+            format!("{} warnings", transform.parse_errors.len()),
         );
     }
-    if output_summary.wrote_warnings && !artifacts.semantic_errors.is_empty() {
+    if !transform.semantic_errors.is_empty() {
         print_detail(
             "semantic",
-            format!("{} warnings", artifacts.semantic_errors.len()),
+            format!("{} warnings", transform.semantic_errors.len()),
         );
     }
 
     Ok(())
 }
 
-fn run_pack(config: PackConfig) -> Result<(), Box<dyn Error>> {
+fn run_pack(config: &PackConfig) -> Result<(), Box<dyn Error>> {
     println!("debun");
     print_detail("from", config.from_dir.display());
     print_detail("output", config.out_file.display());
     println!();
 
     print_phase(1, 2, "pack");
-    let summary = pack_binary(&config)?;
+    let summary = pack_binary(config)?;
 
     println!();
     println!("done");
     print_detail("output", config.out_file.display());
     print_detail("root", summary.replacements_root.display());
-    print_detail("contents", summary.replaced_contents);
-    if summary.replaced_sourcemaps > 0 {
-        print_detail("sourcemaps", summary.replaced_sourcemaps);
+    print_detail("contents", summary.replacement_counts.contents);
+    if summary.replacement_counts.sourcemaps > 0 {
+        print_detail("sourcemaps", summary.replacement_counts.sourcemaps);
     }
-    if summary.replaced_bytecodes > 0 {
-        print_detail("bytecode", summary.replaced_bytecodes);
+    if summary.replacement_counts.bytecodes > 0 {
+        print_detail("bytecode", summary.replacement_counts.bytecodes);
     }
-    if summary.replaced_module_infos > 0 {
-        print_detail("module-info", summary.replaced_module_infos);
+    if summary.replacement_counts.module_infos > 0 {
+        print_detail("module-info", summary.replacement_counts.module_infos);
     }
 
     Ok(())
@@ -132,15 +139,14 @@ fn print_inspection_details(inspection: Option<&embedded::BinaryInspection>) {
     if let Some(version) = inspection.bun_version.as_deref() {
         print_detail("bun", version);
     }
-    if let Some(record_size) = inspection.standalone_record_size {
-        let layout = inspection.standalone_layout.unwrap_or("unknown");
+    if let Some(layout) = inspection.standalone_record_layout {
         print_detail(
             "standalone",
-            format!("{layout} ({record_size}-byte record)"),
+            format!("{} ({}-byte record)", layout.label(), layout.size()),
         );
     }
 }
 
 fn print_detail(label: &str, value: impl std::fmt::Display) {
-    println!("  {:<10} {}", label, value);
+    println!("  {label:<10} {value}");
 }

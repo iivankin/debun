@@ -1,6 +1,6 @@
 use std::{error::Error, fs, path::Path};
 
-use crate::standalone::inspect_executable;
+use crate::standalone::{ModuleRecordLayout, inspect_executable};
 
 mod detect;
 mod metadata;
@@ -18,8 +18,8 @@ use raw::{
 use structured::structured_embedded_files;
 use version::detect_bun_version;
 
-const MACH_O_MAGIC_64: u32 = 0xfeedfacf;
-const MACH_O_MAGIC_32: u32 = 0xfeedface;
+const MACH_O_MAGIC_64: u32 = 0xfeed_facf;
+const MACH_O_MAGIC_32: u32 = 0xfeed_face;
 const LC_SEGMENT_64: u32 = 0x19;
 const LC_SEGMENT: u32 = 0x1;
 const LC_SYMTAB: u32 = 0x2;
@@ -40,14 +40,23 @@ pub struct BinaryInspection {
     pub bun_section_headerless_offset: Option<usize>,
     pub standalone_graph_file_offset: Option<usize>,
     pub standalone_graph_bytes: Option<Vec<u8>>,
-    pub standalone_layout: Option<&'static str>,
-    pub standalone_record_size: Option<usize>,
+    pub standalone_record_layout: Option<ModuleRecordLayout>,
     pub bun_version: Option<String>,
     pub bunfs_paths: Vec<String>,
     pub metadata: Vec<(String, String)>,
     pub files: Vec<EmbeddedFile>,
     pub entry_point_path: Option<String>,
     pub entry_point_source: Option<String>,
+}
+
+impl BinaryInspection {
+    pub(crate) fn standalone_layout_label(&self) -> Option<&'static str> {
+        self.standalone_record_layout.map(ModuleRecordLayout::label)
+    }
+
+    pub(crate) fn standalone_record_size(&self) -> Option<usize> {
+        self.standalone_record_layout.map(ModuleRecordLayout::size)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -119,15 +128,15 @@ fn inspect_binary_bytes(bytes: &[u8]) -> Result<Option<BinaryInspection>, Box<dy
             .to_vec();
         let bun_strings = printable_strings(&raw_bytes);
         let metadata = collect_metadata(&bun_strings);
-        let structured_files = structured_embedded_files(&standalone.files);
-        let bunfs_paths = if standalone.files.is_empty() {
+        let bunfs_paths = standalone
+            .bunfs_modules()
+            .map(|module| module.virtual_path.clone())
+            .collect::<Vec<_>>();
+        let structured_files = structured_embedded_files(standalone.bunfs_modules());
+        let bunfs_paths = if bunfs_paths.is_empty() {
             collect_bunfs_paths(&raw_bytes)
         } else {
-            standalone
-                .files
-                .iter()
-                .map(|file| file.virtual_path.clone())
-                .collect::<Vec<_>>()
+            bunfs_paths
         };
 
         return Ok(Some(BinaryInspection {
@@ -139,8 +148,7 @@ fn inspect_binary_bytes(bytes: &[u8]) -> Result<Option<BinaryInspection>, Box<dy
                 .map(|_| std::mem::size_of::<u64>()),
             standalone_graph_file_offset: Some(standalone.payload_file_offset),
             standalone_graph_bytes: Some(payload_bytes),
-            standalone_layout: Some(standalone.record_layout),
-            standalone_record_size: Some(standalone.record_size),
+            standalone_record_layout: Some(standalone.record_layout),
             bun_version,
             bunfs_paths,
             metadata,
@@ -159,7 +167,7 @@ fn inspect_binary_bytes(bytes: &[u8]) -> Result<Option<BinaryInspection>, Box<dy
         .and_then(|section| {
             bytes
                 .get(section.fileoff..section.fileoff.saturating_add(section.filesize))
-                .map(|slice| slice.to_vec())
+                .map(<[u8]>::to_vec)
         })
         .unwrap_or_default();
     if section_bytes.is_empty() {
@@ -179,8 +187,7 @@ fn inspect_binary_bytes(bytes: &[u8]) -> Result<Option<BinaryInspection>, Box<dy
         bun_section_headerless_offset: headerless_offset,
         standalone_graph_file_offset: None,
         standalone_graph_bytes: None,
-        standalone_layout: None,
-        standalone_record_size: None,
+        standalone_record_layout: None,
         bun_version,
         bunfs_paths,
         metadata,

@@ -21,6 +21,7 @@ pub(super) fn rename_symbols(
         let old_name = scoping.symbol_name(symbol_id).to_string();
         let flags = scoping.symbol_flags(symbol_id);
         let scope_id = scoping.symbol_scope_id(symbol_id);
+        let kind = classify(flags);
 
         let new_name = if let Some(preferred_name) = preferred_names.get(&symbol_id) {
             if old_name == *preferred_name {
@@ -29,13 +30,12 @@ pub(super) fn rename_symbols(
             if local_name_available(scoping, scope_id, symbol_id, preferred_name) {
                 preferred_name.clone()
             } else if should_rename(&old_name, flags) {
-                let kind = classify(flags);
                 next_name(
                     scoping,
                     scope_id,
                     symbol_id,
                     &mut counters,
-                    kind.prefix,
+                    kind,
                     module_name,
                 )
             } else {
@@ -45,13 +45,12 @@ pub(super) fn rename_symbols(
             if !should_rename(&old_name, flags) {
                 continue;
             }
-            let kind = classify(flags);
             next_name(
                 scoping,
                 scope_id,
                 symbol_id,
                 &mut counters,
-                kind.prefix,
+                kind,
                 module_name,
             )
         };
@@ -66,7 +65,7 @@ pub(super) fn rename_symbols(
         renames.push(SymbolRename {
             old_name,
             new_name,
-            kind: classify(flags).label,
+            kind: kind.label(),
             scope_debug: format!("{scope_id:?}"),
             references,
         });
@@ -144,10 +143,7 @@ fn looks_minified(name: &str) -> bool {
         return true;
     }
 
-    let upper_count = name
-        .bytes()
-        .filter(|byte| byte.is_ascii_uppercase())
-        .count();
+    let upper_count = name.bytes().filter(u8::is_ascii_uppercase).count();
     upper_count >= 2 && name.len() <= 6
 }
 
@@ -160,52 +156,62 @@ fn looks_generated_name(name: &str) -> bool {
 }
 
 #[derive(Clone, Copy)]
-struct KindInfo {
-    label: &'static str,
-    prefix: &'static str,
+enum RenameKind {
+    Function,
+    Class,
+    Import,
+    Catch,
+    Const,
+    Let,
+    Var,
+    Value,
 }
 
-fn classify(flags: SymbolFlags) -> KindInfo {
+impl RenameKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Class => "class",
+            Self::Import => "import",
+            Self::Catch => "catch",
+            Self::Const => "const",
+            Self::Let => "let",
+            Self::Var => "var",
+            Self::Value => "value",
+        }
+    }
+
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::Function => "fn",
+            Self::Class => "class",
+            Self::Import => "import",
+            Self::Catch => "catch",
+            Self::Const => "const",
+            Self::Let => "let",
+            Self::Var => "var",
+            Self::Value => "value",
+        }
+    }
+}
+
+fn classify(flags: SymbolFlags) -> RenameKind {
     if flags.contains(SymbolFlags::Function) {
-        KindInfo {
-            label: "function",
-            prefix: "fn",
-        }
+        RenameKind::Function
     } else if flags.contains(SymbolFlags::Class) {
-        KindInfo {
-            label: "class",
-            prefix: "class",
-        }
+        RenameKind::Class
     } else if flags.contains(SymbolFlags::Import) {
-        KindInfo {
-            label: "import",
-            prefix: "import",
-        }
+        RenameKind::Import
     } else if flags.contains(SymbolFlags::CatchVariable) {
-        KindInfo {
-            label: "catch",
-            prefix: "catch",
-        }
+        RenameKind::Catch
     } else if flags.contains(SymbolFlags::ConstVariable) {
-        KindInfo {
-            label: "const",
-            prefix: "const",
-        }
+        RenameKind::Const
     } else if flags.contains(SymbolFlags::BlockScopedVariable) {
-        KindInfo {
-            label: "let",
-            prefix: "let",
-        }
+        RenameKind::Let
     } else if flags.contains(SymbolFlags::FunctionScopedVariable) {
-        KindInfo {
-            label: "var",
-            prefix: "var",
-        }
+        RenameKind::Var
     } else {
-        KindInfo {
-            label: "value",
-            prefix: "value",
-        }
+        RenameKind::Value
     }
 }
 
@@ -222,16 +228,16 @@ struct RenameCounters {
 }
 
 impl RenameCounters {
-    fn next(&mut self, prefix: &str) -> usize {
-        let slot = match prefix {
-            "fn" => &mut self.function,
-            "class" => &mut self.class,
-            "import" => &mut self.import,
-            "catch" => &mut self.catch,
-            "const" => &mut self.constant,
-            "let" => &mut self.let_like,
-            "var" => &mut self.var_like,
-            _ => &mut self.value,
+    fn next(&mut self, kind: RenameKind) -> usize {
+        let slot = match kind {
+            RenameKind::Function => &mut self.function,
+            RenameKind::Class => &mut self.class,
+            RenameKind::Import => &mut self.import,
+            RenameKind::Catch => &mut self.catch,
+            RenameKind::Const => &mut self.constant,
+            RenameKind::Let => &mut self.let_like,
+            RenameKind::Var => &mut self.var_like,
+            RenameKind::Value => &mut self.value,
         };
         *slot += 1;
         *slot
@@ -243,12 +249,17 @@ fn next_name(
     scope_id: ScopeId,
     symbol_id: SymbolId,
     counters: &mut RenameCounters,
-    prefix: &str,
+    kind: RenameKind,
     module_name: &str,
 ) -> String {
     loop {
-        let ordinal = counters.next(prefix);
-        let candidate = format!("{}_{}_{}", module_name_slug(module_name), prefix, ordinal);
+        let ordinal = counters.next(kind);
+        let candidate = format!(
+            "{}_{}_{}",
+            module_name_slug(module_name),
+            kind.prefix(),
+            ordinal
+        );
         if local_name_available(scoping, scope_id, symbol_id, &candidate) {
             return candidate;
         }

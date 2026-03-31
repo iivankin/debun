@@ -1,10 +1,11 @@
 use std::error::Error;
 
 use super::{
-    BUNFS_ROOT_PREFIX, ModuleRecordLayout, RawStringPointer, STRING_POINTER_SIZE, StandaloneModule,
-    TRAILER, WINDOWS_BUNFS_ROOT_PREFIX, parse_offsets, parse_string_pointer,
+    ModuleRecordLayout, RawStringPointer, STRING_POINTER_SIZE, TRAILER, is_bunfs_virtual_path,
+    non_empty_pointer_offset, normalize_virtual_path, parse_offsets, parse_string_pointer,
+    slice_optional_pointer, slice_pointer,
 };
-use crate::standalone::{StandaloneFile, StandaloneInspection, container::ContainerPayload};
+use crate::standalone::{StandaloneInspection, StandaloneModule, container::ContainerPayload};
 
 #[derive(Debug, Clone)]
 struct ParsedModuleRecord {
@@ -49,61 +50,24 @@ pub(super) fn parse_payload(
     let (record_layout, records) =
         parse_module_records(body, modules_bytes, offsets.entry_point_id)?;
     let compile_exec_argv =
-        slice_optional_pointer(body, offsets._compile_exec_argv_ptr).map(<[u8]>::to_vec);
+        slice_optional_pointer(body, offsets.compile_exec_argv_ptr).map(<[u8]>::to_vec);
+    let entry_point_index = usize::try_from(offsets.entry_point_id)
+        .map_err(|_| "standalone payload entry point id exceeded usize")?;
 
-    let mut files = Vec::new();
     let mut modules = Vec::with_capacity(records.len());
     let mut entry_point_path = None;
     let mut entry_point_source = None;
 
     for (index, record) in records.iter().enumerate() {
-        let Some(contents_bytes) = slice_pointer(body, record.contents_ptr) else {
+        let Some(module) = build_module(body, record) else {
             continue;
         };
 
-        let normalized_path = normalize_virtual_path(&record.name);
-        if index == offsets.entry_point_id as usize {
-            entry_point_path = Some(normalized_path.clone());
-            if looks_like_javascript_source(contents_bytes) {
-                entry_point_source = std::str::from_utf8(contents_bytes).ok().map(str::to_string);
+        if index == entry_point_index {
+            entry_point_path = Some(module.virtual_path.clone());
+            if looks_like_javascript_source(&module.bytes) {
+                entry_point_source = std::str::from_utf8(&module.bytes).ok().map(str::to_string);
             }
-        }
-
-        let module = StandaloneModule {
-            original_path: record.name.clone(),
-            virtual_path: normalized_path,
-            source_offset: record.contents_ptr.offset as usize,
-            bytes: contents_bytes.to_vec(),
-            sourcemap: slice_optional_pointer(body, record.sourcemap_ptr).map(<[u8]>::to_vec),
-            sourcemap_offset: non_empty_pointer_offset(record.sourcemap_ptr),
-            bytecode: slice_optional_pointer(body, record.bytecode_ptr).map(<[u8]>::to_vec),
-            bytecode_offset: non_empty_pointer_offset(record.bytecode_ptr),
-            module_info: slice_optional_pointer(body, record.module_info_ptr).map(<[u8]>::to_vec),
-            module_info_offset: non_empty_pointer_offset(record.module_info_ptr),
-            bytecode_origin_path: record.bytecode_origin_path.clone(),
-            encoding: record.encoding,
-            loader: record.loader,
-            module_format: record.module_format,
-            side: record.side,
-        };
-
-        if is_bunfs_virtual_path(&record.name) {
-            files.push(StandaloneFile {
-                virtual_path: module.virtual_path.clone(),
-                source_offset: module.source_offset,
-                bytes: module.bytes.clone(),
-                sourcemap: module.sourcemap.clone(),
-                sourcemap_offset: module.sourcemap_offset,
-                bytecode: module.bytecode.clone(),
-                bytecode_offset: module.bytecode_offset,
-                module_info: module.module_info.clone(),
-                module_info_offset: module.module_info_offset,
-                bytecode_origin_path: module.bytecode_origin_path.clone(),
-                encoding: module.encoding,
-                loader: module.loader,
-                module_format: module.module_format,
-                side: module.side,
-            });
         }
 
         modules.push(module);
@@ -115,16 +79,35 @@ pub(super) fn parse_payload(
         raw_container_bytes: payload.raw_container_bytes.map(<[u8]>::to_vec),
         payload_file_offset: payload.payload_file_offset,
         payload_bytes: payload.payload_bytes.to_vec(),
-        record_layout: record_layout.label(),
-        record_size: record_layout.size(),
-        files,
+        record_layout,
         entry_point_path,
         entry_point_source,
         entry_point_id: offsets.entry_point_id,
         compile_exec_argv,
-        flags_bits: offsets._flags_bits,
-        record_layout_kind: record_layout,
+        flags_bits: offsets.flags_bits,
         modules,
+    })
+}
+
+fn build_module(body: &[u8], record: &ParsedModuleRecord) -> Option<StandaloneModule> {
+    let contents_bytes = slice_pointer(body, record.contents_ptr)?;
+
+    Some(StandaloneModule {
+        original_path: record.name.clone(),
+        virtual_path: normalize_virtual_path(&record.name),
+        source_offset: non_empty_pointer_offset(record.contents_ptr)?,
+        bytes: contents_bytes.to_vec(),
+        sourcemap: slice_optional_pointer(body, record.sourcemap_ptr).map(<[u8]>::to_vec),
+        sourcemap_offset: non_empty_pointer_offset(record.sourcemap_ptr),
+        bytecode: slice_optional_pointer(body, record.bytecode_ptr).map(<[u8]>::to_vec),
+        bytecode_offset: non_empty_pointer_offset(record.bytecode_ptr),
+        module_info: slice_optional_pointer(body, record.module_info_ptr).map(<[u8]>::to_vec),
+        module_info_offset: non_empty_pointer_offset(record.module_info_ptr),
+        bytecode_origin_path: record.bytecode_origin_path.clone(),
+        encoding: record.encoding,
+        loader: record.loader,
+        module_format: record.module_format,
+        side: record.side,
     })
 }
 
@@ -133,7 +116,7 @@ fn parse_module_records(
     modules_bytes: &[u8],
     entry_point_id: u32,
 ) -> Result<(ModuleRecordLayout, Vec<ParsedModuleRecord>), Box<dyn Error>> {
-    let mut best_match = None;
+    let mut best_layout = None;
 
     // Bun's standalone graph record format changed across releases.
     // We only need the leading name/contents pointers, so detect the layout
@@ -153,13 +136,13 @@ fn parse_module_records(
             .filter(|record| is_bunfs_virtual_path(&record.name))
             .count();
 
-        match &best_match {
+        match &best_layout {
             Some((best_score, _, _)) if *best_score >= score => {}
-            _ => best_match = Some((score, layout, candidate)),
+            _ => best_layout = Some((score, layout, candidate)),
         }
     }
 
-    if let Some((_, layout, records)) = best_match {
+    if let Some((_, layout, records)) = best_layout {
         Ok((layout, records))
     } else {
         Err("standalone payload module list did not match any supported record layout".into())
@@ -237,7 +220,7 @@ fn try_parse_module_records(
         }
         let name_bytes = slice_pointer(body, name_ptr)?;
         let name = std::str::from_utf8(name_bytes).ok()?.to_string();
-        if name.is_empty() || name.chars().any(|ch| ch.is_control()) {
+        if name.is_empty() || name.chars().any(char::is_control) {
             return None;
         }
         records.push(ParsedModuleRecord {
@@ -262,22 +245,6 @@ fn try_parse_module_records(
     Some(records)
 }
 
-fn slice_pointer(bytes: &[u8], pointer: RawStringPointer) -> Option<&[u8]> {
-    let start = pointer.offset as usize;
-    let end = start.checked_add(pointer.length as usize)?;
-    bytes.get(start..end)
-}
-
-fn slice_optional_pointer(bytes: &[u8], pointer: RawStringPointer) -> Option<&[u8]> {
-    (pointer.length > 0)
-        .then(|| slice_pointer(bytes, pointer))
-        .flatten()
-}
-
-fn non_empty_pointer_offset(pointer: RawStringPointer) -> Option<usize> {
-    (pointer.length > 0).then_some(pointer.offset as usize)
-}
-
 fn looks_like_javascript_source(bytes: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
@@ -290,16 +257,4 @@ fn looks_like_javascript_source(bytes: &[u8]) -> bool {
         || trimmed.starts_with("let ")
         || trimmed.starts_with("const ")
         || trimmed.starts_with("function ")
-}
-
-fn normalize_virtual_path(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix(WINDOWS_BUNFS_ROOT_PREFIX) {
-        format!("{BUNFS_ROOT_PREFIX}{rest}")
-    } else {
-        path.to_string()
-    }
-}
-
-fn is_bunfs_virtual_path(path: &str) -> bool {
-    path.starts_with(BUNFS_ROOT_PREFIX) || path.starts_with(WINDOWS_BUNFS_ROOT_PREFIX)
 }

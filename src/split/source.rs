@@ -54,11 +54,7 @@ fn unwrap_block(block_source: &str) -> String {
     let min_indent = lines
         .iter()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            line.chars()
-                .take_while(|ch| ch.is_ascii_whitespace())
-                .count()
-        })
+        .map(|line| line.chars().take_while(char::is_ascii_whitespace).count())
         .min()
         .unwrap_or(0);
 
