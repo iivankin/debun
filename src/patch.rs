@@ -504,7 +504,7 @@ fn render_patch_bundle(bundle: &PatchBundle) -> String {
 
 fn parse_patch_bundle(bytes: &[u8]) -> Result<PatchBundle, Box<dyn Error>> {
     let text = std::str::from_utf8(bytes).map_err(|_| "patch file is not valid UTF-8")?;
-    let mut lines = text.lines().enumerate().peekable();
+    let mut lines = text.lines().enumerate();
     let Some((_, first_line)) = lines.next() else {
         return Err("patch file is empty".into());
     };
@@ -517,7 +517,7 @@ fn parse_patch_bundle(bytes: &[u8]) -> Result<PatchBundle, Box<dyn Error>> {
     let mut records = Vec::new();
     let mut pending: Option<PendingRecord> = None;
 
-    while let Some((index, line)) = lines.next() {
+    for (index, line) in lines {
         if line.is_empty() {
             continue;
         }
@@ -557,15 +557,15 @@ fn parse_patch_bundle(bytes: &[u8]) -> Result<PatchBundle, Box<dyn Error>> {
         records.push(record.finish(text.lines().count())?);
     }
 
-    if let Some(expected) = record_count {
-        if expected != records.len() {
-            return Err(format!(
-                "patch record count mismatch: header says {}, parsed {}",
-                expected,
-                records.len()
-            )
-            .into());
-        }
+    if let Some(expected) = record_count
+        && expected != records.len()
+    {
+        return Err(format!(
+            "patch record count mismatch: header says {}, parsed {}",
+            expected,
+            records.len()
+        )
+        .into());
     }
 
     let mut seen = HashSet::new();
@@ -666,7 +666,7 @@ fn hex_digit(value: u8) -> char {
 }
 
 fn hex_decode(value: &str) -> Result<Vec<u8>, Box<dyn Error>> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(format!("hex field had odd length: {}", value.len()).into());
     }
 
