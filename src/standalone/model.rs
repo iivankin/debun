@@ -107,18 +107,45 @@ impl ModuleRecordLayout {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReplacementParts {
-    pub(crate) contents: Option<Vec<u8>>,
-    pub(crate) sourcemap: Option<Vec<u8>>,
-    pub(crate) bytecode: Option<Vec<u8>>,
-    pub(crate) module_info: Option<Vec<u8>>,
+    pub(crate) contents: RequiredReplacement,
+    pub(crate) sourcemap: OptionalReplacement,
+    pub(crate) bytecode: OptionalReplacement,
+    pub(crate) module_info: OptionalReplacement,
 }
 
 impl ReplacementParts {
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.contents.is_none()
-            && self.sourcemap.is_none()
-            && self.bytecode.is_none()
-            && self.module_info.is_none()
+    pub(crate) fn is_empty(&self) -> bool {
+        self.contents.is_keep()
+            && self.sourcemap.is_keep()
+            && self.bytecode.is_keep()
+            && self.module_info.is_keep()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum RequiredReplacement {
+    #[default]
+    Keep,
+    Replace(Vec<u8>),
+}
+
+impl RequiredReplacement {
+    pub(crate) const fn is_keep(&self) -> bool {
+        matches!(self, Self::Keep)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum OptionalReplacement {
+    #[default]
+    Keep,
+    Replace(Vec<u8>),
+    Remove,
+}
+
+impl OptionalReplacement {
+    pub(crate) const fn is_keep(&self) -> bool {
+        matches!(self, Self::Keep)
     }
 }
 

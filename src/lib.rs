@@ -7,6 +7,7 @@ mod json;
 mod output;
 mod pack;
 mod pack_support;
+mod patch;
 mod rewrite;
 mod split;
 mod standalone;
@@ -14,17 +15,20 @@ mod standalone_decode;
 
 use std::{error::Error, fs};
 
-use args::{Command, Config, PackConfig};
+use args::{ApplyPatchConfig, Command, Config, PackConfig, PatchConfig};
 use embedded::inspect_binary;
 use extract::ExtractedSource;
 use js::transform_source;
 use output::write_outputs;
 use pack::pack_binary;
+use patch::{apply_patch, create_patch};
 
 pub fn run(command: Command) -> Result<(), Box<dyn Error>> {
     match command {
         Command::Unpack(config) => run_unpack(&config),
         Command::Pack(config) => run_pack(&config),
+        Command::Patch(config) => run_patch(&config),
+        Command::ApplyPatch(config) => run_apply_patch(&config),
     }
 }
 
@@ -115,6 +119,65 @@ fn run_pack(config: &PackConfig) -> Result<(), Box<dyn Error>> {
     }
     if summary.replacement_counts.module_infos > 0 {
         print_detail("module-info", summary.replacement_counts.module_infos);
+    }
+
+    Ok(())
+}
+
+fn run_patch(config: &PatchConfig) -> Result<(), Box<dyn Error>> {
+    println!("debun");
+    print_detail("from", config.from_dir.display());
+    print_detail("output", config.out_file.display());
+    println!();
+
+    print_phase(1, 2, "patch");
+    let summary = create_patch(config)?;
+
+    println!();
+    println!("done");
+    print_detail("output", config.out_file.display());
+    print_detail("root", summary.replacements_root.display());
+    print_detail("contents", summary.record_counts.contents);
+    if summary.record_counts.sourcemaps > 0 {
+        print_detail("sourcemaps", summary.record_counts.sourcemaps);
+    }
+    if summary.record_counts.bytecodes > 0 {
+        print_detail("bytecode", summary.record_counts.bytecodes);
+    }
+    if summary.record_counts.module_infos > 0 {
+        print_detail("module-info", summary.record_counts.module_infos);
+    }
+
+    Ok(())
+}
+
+fn run_apply_patch(config: &ApplyPatchConfig) -> Result<(), Box<dyn Error>> {
+    println!("debun");
+    print_detail("patch", config.patch_file.display());
+    if let Some(input) = &config.input {
+        print_detail("input", input.display());
+    }
+    if let Some(out_file) = &config.out_file {
+        print_detail("output", out_file.display());
+    }
+    println!();
+
+    print_phase(1, 2, "apply-patch");
+    let summary = apply_patch(config)?;
+
+    println!();
+    println!("done");
+    print_detail("input", summary.input_file.display());
+    print_detail("output", summary.out_file.display());
+    print_detail("contents", summary.record_counts.contents);
+    if summary.record_counts.sourcemaps > 0 {
+        print_detail("sourcemaps", summary.record_counts.sourcemaps);
+    }
+    if summary.record_counts.bytecodes > 0 {
+        print_detail("bytecode", summary.record_counts.bytecodes);
+    }
+    if summary.record_counts.module_infos > 0 {
+        print_detail("module-info", summary.record_counts.module_infos);
     }
 
     Ok(())

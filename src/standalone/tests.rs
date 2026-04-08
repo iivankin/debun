@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use super::layout::{
     MODULE_RECORD_SIZE_COMPACT, MODULE_RECORD_SIZE_EXTENDED, MODULE_RECORD_SIZE_WITH_MODULE_INFO,
 };
-use super::{OFFSETS_SIZE_64, ReplacementParts, TRAILER, inspect_executable, repack_executable};
+use super::{
+    OFFSETS_SIZE_64, OptionalReplacement, ReplacementParts, RequiredReplacement, TRAILER,
+    inspect_executable, repack_executable,
+};
 
 #[derive(Debug, Clone, Copy)]
 struct TestModule<'a> {
@@ -329,10 +332,10 @@ fn repacks_appended_standalone_graph_with_replacements() {
     replacements.insert(
         "/$bunfs/root/app.js".to_string(),
         ReplacementParts {
-            contents: Some(b"// @bun\nconsole.log('patched');\n".to_vec()),
-            sourcemap: Some(b"NEW-SMAP".to_vec()),
-            bytecode: None,
-            module_info: Some(b"NEW-META".to_vec()),
+            contents: RequiredReplacement::Replace(b"// @bun\nconsole.log('patched');\n".to_vec()),
+            sourcemap: OptionalReplacement::Replace(b"NEW-SMAP".to_vec()),
+            bytecode: OptionalReplacement::Keep,
+            module_info: OptionalReplacement::Replace(b"NEW-META".to_vec()),
         },
     );
 
@@ -357,4 +360,51 @@ fn repacks_appended_standalone_graph_with_replacements() {
     assert_eq!(entry.sourcemap.as_deref(), Some(b"NEW-SMAP".as_slice()));
     assert_eq!(entry.bytecode.as_deref(), Some(b"BYTE".as_slice()));
     assert_eq!(entry.module_info.as_deref(), Some(b"NEW-META".as_slice()));
+}
+
+#[test]
+fn repacks_appended_standalone_graph_with_removed_optional_parts() {
+    let payload = build_payload(
+        &[TestModule {
+            name: "/$bunfs/root/app.js",
+            contents: b"// @bun\nconsole.log('entry');\n",
+            sourcemap: b"SMAP",
+            bytecode: b"BYTE",
+            module_info: b"META",
+            bytecode_origin_path: Some("B:/~BUN/root/app.js"),
+        }],
+        0,
+        TestModuleRecordLayout::Extended,
+    );
+
+    let (exe, _) = build_appended_executable(&payload);
+    let inspection = inspect_executable(&exe)
+        .expect("parser should not fail")
+        .expect("parser should find an appended payload");
+
+    let mut replacements = HashMap::new();
+    replacements.insert(
+        "/$bunfs/root/app.js".to_string(),
+        ReplacementParts {
+            contents: RequiredReplacement::Keep,
+            sourcemap: OptionalReplacement::Remove,
+            bytecode: OptionalReplacement::Keep,
+            module_info: OptionalReplacement::Remove,
+        },
+    );
+
+    let repacked =
+        repack_executable(&exe, inspection, &replacements).expect("repack should succeed");
+    let patched = inspect_executable(&repacked.bytes)
+        .expect("parser should not fail")
+        .expect("parser should find the repacked payload");
+    let entry = patched.bunfs_modules().next().expect("expected bunfs file");
+
+    assert_eq!(repacked.replacement_counts.contents, 0);
+    assert_eq!(repacked.replacement_counts.sourcemaps, 1);
+    assert_eq!(repacked.replacement_counts.bytecodes, 0);
+    assert_eq!(repacked.replacement_counts.module_infos, 1);
+    assert_eq!(entry.sourcemap, None);
+    assert_eq!(entry.bytecode.as_deref(), Some(b"BYTE".as_slice()));
+    assert_eq!(entry.module_info, None);
 }

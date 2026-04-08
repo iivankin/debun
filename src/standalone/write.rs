@@ -1,8 +1,9 @@
 use std::{collections::HashMap, error::Error, mem::size_of};
 
+use super::OptionalReplacement;
 use super::{
     ModuleRecordLayout, RepackedExecutable, ReplacementCounts, ReplacementParts,
-    StandaloneInspection, StandaloneModule, TRAILER,
+    RequiredReplacement, StandaloneInspection, StandaloneModule, TRAILER,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -32,13 +33,13 @@ struct ResolvedModuleParts<'a> {
 }
 
 impl<'a> ResolvedRequiredPart<'a> {
-    fn resolve(replacement: Option<&'a [u8]>, original: &'a [u8]) -> Self {
+    fn resolve(replacement: &'a RequiredReplacement, original: &'a [u8]) -> Self {
         match replacement {
-            Some(bytes) => Self {
+            RequiredReplacement::Replace(bytes) => Self {
                 bytes,
                 replaced: true,
             },
-            None => Self {
+            RequiredReplacement::Keep => Self {
                 bytes: original,
                 replaced: false,
             },
@@ -47,13 +48,17 @@ impl<'a> ResolvedRequiredPart<'a> {
 }
 
 impl<'a> ResolvedOptionalPart<'a> {
-    fn resolve(replacement: Option<&'a [u8]>, original: Option<&'a [u8]>) -> Self {
+    fn resolve(replacement: &'a OptionalReplacement, original: Option<&'a [u8]>) -> Self {
         match replacement {
-            Some(bytes) => Self {
+            OptionalReplacement::Replace(bytes) => Self {
                 bytes: Some(bytes),
                 replaced: true,
             },
-            None => Self {
+            OptionalReplacement::Remove => Self {
+                bytes: None,
+                replaced: true,
+            },
+            OptionalReplacement::Keep => Self {
                 bytes: original,
                 replaced: false,
             },
@@ -63,23 +68,40 @@ impl<'a> ResolvedOptionalPart<'a> {
 
 impl<'a> ResolvedModuleParts<'a> {
     fn new(module: &'a StandaloneModule, replacement: Option<&'a ReplacementParts>) -> Self {
-        Self {
-            contents: ResolvedRequiredPart::resolve(
-                replacement.and_then(|parts| parts.contents.as_deref()),
-                &module.bytes,
-            ),
-            sourcemap: ResolvedOptionalPart::resolve(
-                replacement.and_then(|parts| parts.sourcemap.as_deref()),
-                module.sourcemap.as_deref(),
-            ),
-            bytecode: ResolvedOptionalPart::resolve(
-                replacement.and_then(|parts| parts.bytecode.as_deref()),
-                module.bytecode.as_deref(),
-            ),
-            module_info: ResolvedOptionalPart::resolve(
-                replacement.and_then(|parts| parts.module_info.as_deref()),
-                module.module_info.as_deref(),
-            ),
+        match replacement {
+            Some(replacement) => Self {
+                contents: ResolvedRequiredPart::resolve(&replacement.contents, &module.bytes),
+                sourcemap: ResolvedOptionalPart::resolve(
+                    &replacement.sourcemap,
+                    module.sourcemap.as_deref(),
+                ),
+                bytecode: ResolvedOptionalPart::resolve(
+                    &replacement.bytecode,
+                    module.bytecode.as_deref(),
+                ),
+                module_info: ResolvedOptionalPart::resolve(
+                    &replacement.module_info,
+                    module.module_info.as_deref(),
+                ),
+            },
+            None => Self {
+                contents: ResolvedRequiredPart {
+                    bytes: &module.bytes,
+                    replaced: false,
+                },
+                sourcemap: ResolvedOptionalPart {
+                    bytes: module.sourcemap.as_deref(),
+                    replaced: false,
+                },
+                bytecode: ResolvedOptionalPart {
+                    bytes: module.bytecode.as_deref(),
+                    replaced: false,
+                },
+                module_info: ResolvedOptionalPart {
+                    bytes: module.module_info.as_deref(),
+                    replaced: false,
+                },
+            },
         }
     }
 

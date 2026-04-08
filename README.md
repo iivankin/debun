@@ -9,6 +9,7 @@ It can:
 - deterministically rename minified locals
 - split CommonJS and lazy-init bundles into separate files when the input is a single wrapped bundle and `--unbundle` is enabled
 - pack edited extracted BunFS files back into a Bun standalone binary
+- generate portable `.patch` bundles from edited extracted BunFS files and apply them to an original standalone binary
 
 ## Install
 
@@ -47,6 +48,8 @@ debun ./app-binary --out-dir ./out/app
 debun ./bundle.js --out-dir ./out/bundle
 debun ./bundle.js --out-dir ./out/bundle --unbundle
 debun pack ./out/app --out ./app-binary.repacked
+debun patch ./out/app --out ./app-binary.patch
+debun apply-patch ./app-binary.patch ./app-binary --out ./app-binary.patched
 ```
 
 Available flags:
@@ -54,6 +57,8 @@ Available flags:
 ```bash
 debun <input> [--out-dir <dir>] [--module-name <name>] [--no-rename] [--unbundle]
 debun pack [<dir>] [--out <file>]
+debun patch [<dir>] [--out <file>]
+debun apply-patch <patch-file> [<input-binary>] [--out <file>]
 ```
 
 ## Output
@@ -95,6 +100,28 @@ debun pack ./out/app --out ./app-binary.repacked
 
 `pack` supports Bun standalone executables. It uses the saved base executable from `.debun/` and swaps only the embedded standalone payload.
 On macOS the packed output is re-signed ad-hoc automatically, because mutating the Mach-O bytes invalidates the original embedded signature.
+
+## Patch Workflow
+
+Use `patch` when you want a portable bundle of just the changes you made after unpacking:
+
+```bash
+debun ./app-binary --out-dir ./out/app
+# edit ./out/app/embedded/files/...
+debun patch ./out/app --out ./app-binary.patch
+debun apply-patch ./app-binary.patch ./app-binary --out ./app-binary.patched
+```
+
+`patch` compares the edited workspace against the saved base executable under `.debun/` and writes a debun `.patch` bundle.
+`apply-patch` validates that the target standalone binary still matches the original bytes expected by the patch before rebuilding the embedded payload.
+
+The patch workflow follows the same packable surface as `pack`:
+- BunFS file contents
+- `.debun-sourcemap.bin`
+- `.debun-bytecode.bin`
+- `.debun-module-info.bin`
+
+Decoded helper files like `.debun-sourcemap.json` and `.debun-module-info.json` are read-only views and are not included in patches.
 
 ## What Works Well
 

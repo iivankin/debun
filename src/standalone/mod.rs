@@ -16,8 +16,9 @@ use self::layout::{
     slice_optional_pointer, slice_pointer,
 };
 pub(crate) use self::model::{
-    ModuleRecordLayout, RepackedExecutable, ReplacementCounts, ReplacementParts,
-    StandaloneInspection, StandaloneModule, StandaloneSidecarKind,
+    ModuleRecordLayout, OptionalReplacement, RepackedExecutable, ReplacementCounts,
+    ReplacementParts, RequiredReplacement, StandaloneInspection, StandaloneModule,
+    StandaloneSidecarKind,
 };
 
 pub(crate) fn inspect_executable(

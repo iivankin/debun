@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf};
 
-mod defaults;
+pub(crate) mod defaults;
 mod parse;
 
 #[derive(Debug, Clone)]
@@ -19,9 +19,24 @@ pub struct PackConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct PatchConfig {
+    pub from_dir: PathBuf,
+    pub out_file: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApplyPatchConfig {
+    pub patch_file: PathBuf,
+    pub input: Option<PathBuf>,
+    pub out_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
 pub enum Command {
     Unpack(Config),
     Pack(PackConfig),
+    Patch(PatchConfig),
+    ApplyPatch(ApplyPatchConfig),
 }
 
 impl Command {
@@ -78,5 +93,32 @@ mod tests {
 
         assert!(config.from_dir.ends_with("app.readable"));
         assert!(config.out_file.ends_with("app.readable.repacked"));
+    }
+
+    #[test]
+    fn patch_defaults_output_path_from_input_directory() {
+        let command = parse(&["debun", "patch", "./app.readable"])
+            .unwrap()
+            .unwrap();
+        let Command::Patch(config) = command else {
+            panic!("expected patch command");
+        };
+
+        assert!(config.from_dir.ends_with("app.readable"));
+        assert!(config.out_file.ends_with("app.readable.patch"));
+    }
+
+    #[test]
+    fn apply_patch_accepts_positional_binary_input() {
+        let command = parse(&["debun", "apply-patch", "./changes.patch", "./app-binary"])
+            .unwrap()
+            .unwrap();
+        let Command::ApplyPatch(config) = command else {
+            panic!("expected apply-patch command");
+        };
+
+        assert!(config.patch_file.ends_with("changes.patch"));
+        assert!(config.input.unwrap().ends_with("app-binary"));
+        assert!(config.out_file.is_none());
     }
 }
