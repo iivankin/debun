@@ -2,23 +2,32 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     fs,
+    io::Write,
+    mem::size_of,
     path::{Path, PathBuf},
 };
 
+use sha2::{Digest, Sha256};
+
 use crate::{
     args::{ApplyPatchConfig, PatchConfig, defaults},
-    embedded::{EmbeddedFile, EmbeddedKind, inspect_binary},
     pack_support::{
-        base_executable_path, read_original_input_path, resign_if_needed,
-        resolve_replacements_root, resolve_workspace_root,
+        base_executable_path, read_original_input_path, resolve_replacements_root,
+        resolve_workspace_root, write_atomic_file, write_repacked_executable,
     },
+    replacement_workspace::{ModulePart, read_module_part, validate_workspace_files},
     standalone::{
         OptionalReplacement, ReplacementCounts, ReplacementParts, RequiredReplacement,
-        StandaloneModule, StandaloneSidecarKind, inspect_executable, repack_executable,
+        StandaloneModule, inspect_executable, repack_executable,
     },
 };
 
-const PATCH_MAGIC: &str = "debun-patch/v1";
+// v2 is a length-prefixed little-endian binary stream:
+// optional original path, record count, then path/part/expected-hash/replacement records.
+const PATCH_MAGIC: &[u8] = b"debun-patch/v2\n";
+const SHA256_LEN: usize = 32;
+const STATE_ABSENT: u8 = 0;
+const STATE_PRESENT: u8 = 1;
 
 pub(crate) struct PatchSummary {
     pub(crate) replacements_root: PathBuf,
@@ -31,120 +40,58 @@ pub(crate) struct ApplyPatchSummary {
     pub(crate) record_counts: ReplacementCounts,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PatchBundle {
     original_path: Option<String>,
     records: Vec<PatchRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct PatchRecord {
     module_path: String,
-    part: PatchPartKind,
-    expected: PatchBytes,
+    part: ModulePart,
+    expected: ExpectedState,
     replacement: PatchBytes,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum PatchPartKind {
-    Contents,
-    SourceMap,
-    Bytecode,
-    ModuleInfo,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedState {
+    Absent,
+    Sha256([u8; SHA256_LEN]),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum PatchBytes {
     Absent,
     Present(Vec<u8>),
 }
 
-impl PatchPartKind {
-    const ALL: [Self; 4] = [
-        Self::Contents,
-        Self::SourceMap,
-        Self::Bytecode,
-        Self::ModuleInfo,
-    ];
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Contents => "contents",
-            Self::SourceMap => "sourcemap",
-            Self::Bytecode => "bytecode",
-            Self::ModuleInfo => "module-info",
-        }
+impl ExpectedState {
+    fn from_original(part: ModulePart, module: &StandaloneModule) -> Self {
+        part.original_bytes(module)
+            .map_or(Self::Absent, |bytes| Self::Sha256(sha256(bytes)))
     }
 
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "contents" => Some(Self::Contents),
-            "sourcemap" => Some(Self::SourceMap),
-            "bytecode" => Some(Self::Bytecode),
-            "module-info" => Some(Self::ModuleInfo),
-            _ => None,
-        }
-    }
-
-    fn workspace_virtual_path(self, module: &StandaloneModule) -> String {
-        match self {
-            Self::Contents => module.virtual_path.clone(),
-            Self::SourceMap => module.sidecar_path(StandaloneSidecarKind::SourceMapBinary),
-            Self::Bytecode => module.sidecar_path(StandaloneSidecarKind::BytecodeBinary),
-            Self::ModuleInfo => module.sidecar_path(StandaloneSidecarKind::ModuleInfoBinary),
-        }
-    }
-
-    fn workspace_relative_path(self, module: &StandaloneModule) -> String {
-        self.workspace_virtual_path(module)
-            .trim_start_matches('/')
-            .to_string()
-    }
-
-    fn expected_state(self, module: &StandaloneModule) -> PatchBytes {
-        match self {
-            Self::Contents => PatchBytes::Present(module.bytes.clone()),
-            Self::SourceMap => PatchBytes::from_optional(module.sourcemap.clone()),
-            Self::Bytecode => PatchBytes::from_optional(module.bytecode.clone()),
-            Self::ModuleInfo => PatchBytes::from_optional(module.module_info.clone()),
-        }
-    }
-
-    fn count(self, counts: &mut ReplacementCounts) {
-        match self {
-            Self::Contents => counts.contents += 1,
-            Self::SourceMap => counts.sourcemaps += 1,
-            Self::Bytecode => counts.bytecodes += 1,
-            Self::ModuleInfo => counts.module_infos += 1,
+    fn matches_original(&self, part: ModulePart, module: &StandaloneModule) -> bool {
+        match (self, part.original_bytes(module)) {
+            (Self::Absent, None) => true,
+            (Self::Sha256(expected), Some(actual)) => *expected == sha256(actual),
+            _ => false,
         }
     }
 }
 
 impl PatchBytes {
-    fn from_optional(value: Option<Vec<u8>>) -> Self {
-        value.map_or(Self::Absent, Self::Present)
-    }
-
     const fn is_absent(&self) -> bool {
         matches!(self, Self::Absent)
     }
 
-    fn render(&self) -> String {
-        match self {
-            Self::Absent => "absent".to_string(),
-            Self::Present(bytes) => format!("present:{}", hex_encode(bytes)),
+    fn matches_original(&self, part: ModulePart, module: &StandaloneModule) -> bool {
+        match (self, part.original_bytes(module)) {
+            (Self::Absent, None) => true,
+            (Self::Present(candidate), Some(original)) => candidate == original,
+            _ => false,
         }
-    }
-
-    fn parse(value: &str) -> Result<Self, Box<dyn Error>> {
-        if value == "absent" {
-            return Ok(Self::Absent);
-        }
-
-        let hex = value
-            .strip_prefix("present:")
-            .ok_or_else(|| format!("invalid patch state: {value}"))?;
-        Ok(Self::Present(hex_decode(hex)?))
     }
 }
 
@@ -165,42 +112,24 @@ pub fn create_patch(config: &PatchConfig) -> Result<PatchSummary, Box<dyn Error>
     let original_bytes = fs::read(&base_executable)?;
     let standalone = inspect_executable(&original_bytes)?
         .ok_or("patch only supports Bun standalone executables")?;
-    let base_inspection = inspect_binary(&base_executable)?
-        .ok_or("patch only supports Bun standalone executables")?;
-    let extracted_paths = base_inspection
-        .files
-        .iter()
-        .map(|file| file.virtual_path.as_str())
-        .collect::<HashSet<_>>();
-
-    validate_workspace_files(
-        &replacements_root,
-        standalone.bunfs_modules(),
-        &base_inspection.files,
-    )?;
+    validate_workspace_files(&replacements_root, standalone.bunfs_modules())?;
 
     let mut records = Vec::new();
     let mut counts = ReplacementCounts::default();
 
     for module in standalone.bunfs_modules() {
-        for part in PatchPartKind::ALL {
-            let expected = part.expected_state(module);
-            let replacement = read_workspace_state(
-                &replacements_root,
-                module,
-                part,
-                extracted_paths.contains(part.workspace_virtual_path(module).as_str()),
-            )?;
+        for part in ModulePart::ALL {
+            let replacement = read_workspace_state(&replacements_root, module, part)?;
             let Some(replacement) = replacement else {
                 continue;
             };
-            if expected == replacement {
+            if replacement.matches_original(part, module) {
                 continue;
             }
-            if part == PatchPartKind::Contents && replacement.is_absent() {
+            if part == ModulePart::Contents && replacement.is_absent() {
                 return Err(format!(
                     "workspace file {} is missing; contents patches cannot delete BunFS modules",
-                    part.workspace_virtual_path(module)
+                    part.virtual_path(module)
                 )
                 .into());
             }
@@ -209,7 +138,7 @@ pub fn create_patch(config: &PatchConfig) -> Result<PatchSummary, Box<dyn Error>
             records.push(PatchRecord {
                 module_path: module.virtual_path.clone(),
                 part,
-                expected,
+                expected: ExpectedState::from_original(part, module),
                 replacement,
             });
         }
@@ -227,14 +156,7 @@ pub fn create_patch(config: &PatchConfig) -> Result<PatchSummary, Box<dyn Error>
         records,
     };
 
-    if let Some(parent) = config
-        .out_file
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&config.out_file, render_patch_bundle(&bundle))?;
+    write_atomic_file(&config.out_file, |file| write_patch_bundle(file, &bundle))?;
 
     Ok(PatchSummary {
         replacements_root,
@@ -253,23 +175,22 @@ pub fn apply_patch(config: &ApplyPatchConfig) -> Result<ApplyPatchSummary, Box<d
     let original_permissions = fs::metadata(&input_file)?.permissions();
     let standalone = inspect_executable(&original_bytes)?
         .ok_or("apply-patch only supports Bun standalone executables")?;
-    let replacements = build_replacements(&bundle, standalone.bunfs_modules())?;
+    let section_backed_macho = standalone.container.is_macho_section();
     let record_counts = bundle.counts();
-    let output_bytes = if replacements.is_empty() {
-        original_bytes
-    } else {
+    let replacements = build_replacements(bundle.records, standalone.bunfs_modules())?;
+    let modified = !replacements.is_empty();
+    let output_bytes = if modified {
         repack_executable(&original_bytes, standalone, &replacements)?.bytes
+    } else {
+        original_bytes
     };
 
-    if let Some(parent) = out_file
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&out_file, output_bytes)?;
-    fs::set_permissions(&out_file, original_permissions)?;
-    resign_if_needed(&out_file)?;
+    write_repacked_executable(
+        &out_file,
+        &output_bytes,
+        original_permissions,
+        section_backed_macho && modified,
+    )?;
 
     Ok(ApplyPatchSummary {
         input_file,
@@ -292,7 +213,7 @@ fn resolve_apply_input(
 }
 
 fn build_replacements<'a>(
-    bundle: &PatchBundle,
+    records: Vec<PatchRecord>,
     modules: impl IntoIterator<Item = &'a StandaloneModule>,
 ) -> Result<HashMap<String, ReplacementParts>, Box<dyn Error>> {
     let module_map = modules
@@ -301,44 +222,43 @@ fn build_replacements<'a>(
         .collect::<HashMap<_, _>>();
     let mut replacements = HashMap::new();
 
-    for record in &bundle.records {
+    for record in records {
         let module = module_map.get(record.module_path.as_str()).ok_or_else(|| {
             format!(
                 "patch target {} was not found in the input binary",
                 record.module_path
             )
         })?;
-        let actual = record.part.expected_state(module);
-        if actual != record.expected {
+        if !record.expected.matches_original(record.part, module) {
             return Err(format!(
                 "patch does not apply cleanly to {}",
-                record.part.workspace_virtual_path(module)
+                record.part.virtual_path(module)
             )
             .into());
         }
 
         let replacement = replacements
-            .entry(record.module_path.clone())
+            .entry(record.module_path)
             .or_insert_with(ReplacementParts::default);
         match record.part {
-            PatchPartKind::Contents => {
-                let PatchBytes::Present(bytes) = &record.replacement else {
+            ModulePart::Contents => {
+                let PatchBytes::Present(bytes) = record.replacement else {
                     return Err(format!(
                         "patch for {} cannot remove required contents",
-                        record.module_path
+                        module.virtual_path
                     )
                     .into());
                 };
-                replacement.contents = RequiredReplacement::Replace(bytes.clone());
+                replacement.contents = RequiredReplacement::Replace(bytes);
             }
-            PatchPartKind::SourceMap => {
-                replacement.sourcemap = optional_replacement(&record.replacement);
+            ModulePart::SourceMap => {
+                replacement.sourcemap = optional_replacement(record.replacement);
             }
-            PatchPartKind::Bytecode => {
-                replacement.bytecode = optional_replacement(&record.replacement);
+            ModulePart::Bytecode => {
+                replacement.bytecode = optional_replacement(record.replacement);
             }
-            PatchPartKind::ModuleInfo => {
-                replacement.module_info = optional_replacement(&record.replacement);
+            ModulePart::ModuleInfo => {
+                replacement.module_info = optional_replacement(record.replacement);
             }
         }
     }
@@ -346,349 +266,231 @@ fn build_replacements<'a>(
     Ok(replacements)
 }
 
-fn optional_replacement(state: &PatchBytes) -> OptionalReplacement {
+fn optional_replacement(state: PatchBytes) -> OptionalReplacement {
     match state {
         PatchBytes::Absent => OptionalReplacement::Remove,
-        PatchBytes::Present(bytes) => OptionalReplacement::Replace(bytes.clone()),
+        PatchBytes::Present(bytes) => OptionalReplacement::Replace(bytes),
     }
 }
 
 fn read_workspace_state(
     root: &Path,
     module: &StandaloneModule,
-    part: PatchPartKind,
-    originally_extracted: bool,
+    part: ModulePart,
 ) -> Result<Option<PatchBytes>, Box<dyn Error>> {
-    let path = root.join(part.workspace_relative_path(module));
-    if path.is_file() {
-        return Ok(Some(PatchBytes::Present(fs::read(path)?)));
+    if let Some(bytes) = read_module_part(root, module, part)? {
+        return Ok(Some(PatchBytes::Present(bytes)));
     }
-
-    if !originally_extracted {
-        return Ok(None);
-    }
-
-    Ok(Some(PatchBytes::Absent))
+    Ok(part
+        .original_bytes(module)
+        .is_some()
+        .then_some(PatchBytes::Absent))
 }
 
-fn validate_workspace_files<'a>(
-    root: &Path,
-    modules: impl IntoIterator<Item = &'a StandaloneModule>,
-    embedded_files: &[EmbeddedFile],
-) -> Result<(), Box<dyn Error>> {
-    let mut packable_paths = HashSet::new();
-    let mut helper_paths = HashSet::new();
+fn write_patch_bundle(writer: &mut impl Write, bundle: &PatchBundle) -> Result<(), Box<dyn Error>> {
+    writer.write_all(PATCH_MAGIC)?;
+    write_optional_string(writer, bundle.original_path.as_deref())?;
+    write_u32(
+        writer,
+        u32::try_from(bundle.records.len()).map_err(|_| "patch record count exceeded u32")?,
+    )?;
 
-    for module in modules {
-        for part in PatchPartKind::ALL {
-            packable_paths.insert(part.workspace_relative_path(module));
-        }
-        helper_paths.insert(
-            module
-                .sidecar_path(StandaloneSidecarKind::SourceMapJson)
-                .trim_start_matches('/')
-                .to_string(),
-        );
-        helper_paths.insert(
-            module
-                .sidecar_path(StandaloneSidecarKind::ModuleInfoJson)
-                .trim_start_matches('/')
-                .to_string(),
-        );
-    }
-
-    let helper_bytes = embedded_files
-        .iter()
-        .filter_map(|file| match file.kind {
-            EmbeddedKind::StandaloneSourceMapJson | EmbeddedKind::StandaloneModuleInfoJson => {
-                Some((
-                    file.virtual_path.trim_start_matches('/').to_string(),
-                    file.bytes.as_slice(),
-                ))
-            }
-            _ => None,
-        })
-        .collect::<HashMap<_, _>>();
-
-    for relative in collect_workspace_files(root, root)? {
-        if packable_paths.contains(&relative) {
-            continue;
-        }
-
-        if helper_paths.contains(&relative) {
-            let actual = fs::read(root.join(&relative))?;
-            match helper_bytes.get(&relative) {
-                Some(expected) if actual.as_slice() == *expected => continue,
-                Some(_) => {
-                    return Err(format!(
-                        "decoded helper file {} was modified; edit the corresponding .bin file instead",
-                        relative
-                    )
-                    .into());
-                }
-                None => {
-                    return Err(format!(
-                        "helper file {} is not packable; remove it or edit the corresponding .bin file instead",
-                        relative
-                    )
-                    .into());
-                }
+    for record in &bundle.records {
+        write_bytes(writer, record.module_path.as_bytes(), "module path")?;
+        writer.write_all(&[module_part_tag(record.part)])?;
+        match record.expected {
+            ExpectedState::Absent => writer.write_all(&[STATE_ABSENT])?,
+            ExpectedState::Sha256(hash) => {
+                writer.write_all(&[STATE_PRESENT])?;
+                writer.write_all(&hash)?;
             }
         }
-
-        return Err(format!(
-            "workspace file {} is not packable into the standalone binary",
-            relative
-        )
-        .into());
+        match &record.replacement {
+            PatchBytes::Absent => writer.write_all(&[STATE_ABSENT])?,
+            PatchBytes::Present(bytes) => {
+                writer.write_all(&[STATE_PRESENT])?;
+                write_bytes(writer, bytes, "replacement")?;
+            }
+        }
     }
 
     Ok(())
 }
 
-fn collect_workspace_files(root: &Path, current: &Path) -> Result<Vec<String>, Box<dyn Error>> {
-    let mut found = Vec::new();
-    for entry in fs::read_dir(current)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            found.extend(collect_workspace_files(root, &path)?);
-            continue;
+fn write_optional_string(
+    writer: &mut impl Write,
+    value: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    match value {
+        None => writer.write_all(&[STATE_ABSENT])?,
+        Some(value) => {
+            writer.write_all(&[STATE_PRESENT])?;
+            write_bytes(writer, value.as_bytes(), "original path")?;
         }
-        if !path.is_file() {
-            continue;
-        }
-
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| format!("failed to resolve workspace path {}", path.display()))?;
-        found.push(relative.to_string_lossy().replace('\\', "/"));
     }
-
-    found.sort();
-    Ok(found)
+    Ok(())
 }
 
-fn render_patch_bundle(bundle: &PatchBundle) -> String {
-    let mut out = String::new();
-    out.push_str(PATCH_MAGIC);
-    out.push('\n');
-    if let Some(original_path) = &bundle.original_path {
-        out.push_str("original-path=");
-        out.push_str(&hex_encode(original_path.as_bytes()));
-        out.push('\n');
-    }
-    out.push_str("record-count=");
-    out.push_str(&bundle.records.len().to_string());
-    out.push('\n');
+fn write_bytes(writer: &mut impl Write, bytes: &[u8], field: &str) -> Result<(), Box<dyn Error>> {
+    let len = u32::try_from(bytes.len()).map_err(|_| format!("patch {field} exceeded u32"))?;
+    write_u32(writer, len)?;
+    writer.write_all(bytes)?;
+    Ok(())
+}
 
-    for record in &bundle.records {
-        out.push('\n');
-        out.push_str("[[record]]\n");
-        out.push_str("module-path=");
-        out.push_str(&hex_encode(record.module_path.as_bytes()));
-        out.push('\n');
-        out.push_str("part=");
-        out.push_str(record.part.label());
-        out.push('\n');
-        out.push_str("expected=");
-        out.push_str(&record.expected.render());
-        out.push('\n');
-        out.push_str("replacement=");
-        out.push_str(&record.replacement.render());
-        out.push('\n');
-    }
-
-    out
+fn write_u32(writer: &mut impl Write, value: u32) -> Result<(), Box<dyn Error>> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
 }
 
 fn parse_patch_bundle(bytes: &[u8]) -> Result<PatchBundle, Box<dyn Error>> {
-    let text = std::str::from_utf8(bytes).map_err(|_| "patch file is not valid UTF-8")?;
-    let mut lines = text.lines().enumerate();
-    let Some((_, first_line)) = lines.next() else {
+    if bytes.is_empty() {
         return Err("patch file is empty".into());
+    }
+    if !bytes.starts_with(PATCH_MAGIC) {
+        let header_end = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |index| index)
+            .min(64);
+        let header = String::from_utf8_lossy(&bytes[..header_end]);
+        return Err(format!("unsupported patch file header: {header}").into());
+    }
+
+    let mut reader = PatchReader::new(bytes, PATCH_MAGIC.len());
+    let original_path = match reader.read_state("original path state")? {
+        STATE_ABSENT => None,
+        STATE_PRESENT => Some(reader.read_string("original path")?),
+        state => return Err(format!("invalid original path state: {state}").into()),
     };
-    if first_line != PATCH_MAGIC {
-        return Err(format!("unsupported patch file header: {first_line}").into());
-    }
-
-    let mut original_path = None;
-    let mut record_count = None;
+    let record_count = reader.read_u32("record count")?;
     let mut records = Vec::new();
-    let mut pending: Option<PendingRecord> = None;
-
-    for (index, line) in lines {
-        if line.is_empty() {
-            continue;
-        }
-
-        if line == "[[record]]" {
-            if let Some(record) = pending.take() {
-                records.push(record.finish(index + 1)?);
-            }
-            pending = Some(PendingRecord::default());
-            continue;
-        }
-
-        let (key, value) = line
-            .split_once('=')
-            .ok_or_else(|| format!("invalid patch line {}: {}", index + 1, line))?;
-        if let Some(record) = pending.as_mut() {
-            record.set(key, value, index + 1)?;
-            continue;
-        }
-
-        match key {
-            "original-path" => {
-                original_path = Some(String::from_utf8(hex_decode(value)?)?);
-            }
-            "record-count" => {
-                record_count = Some(value.parse::<usize>()?);
-            }
-            _ => {
-                return Err(
-                    format!("unknown patch header field on line {}: {}", index + 1, key).into(),
-                );
-            }
-        }
-    }
-
-    if let Some(record) = pending {
-        records.push(record.finish(text.lines().count())?);
-    }
-
-    if let Some(expected) = record_count
-        && expected != records.len()
-    {
-        return Err(format!(
-            "patch record count mismatch: header says {}, parsed {}",
-            expected,
-            records.len()
-        )
-        .into());
-    }
-
     let mut seen = HashSet::new();
-    for record in &records {
-        if !seen.insert((record.module_path.clone(), record.part)) {
+
+    for _ in 0..record_count {
+        let module_path = reader.read_string("module path")?;
+        let part_tag = reader.read_state("module part")?;
+        let part = module_part_from_tag(part_tag)
+            .ok_or_else(|| format!("invalid patch module part: {part_tag}"))?;
+        if !seen.insert((module_path.clone(), part)) {
             return Err(format!(
                 "patch contains duplicate record for {} ({})",
-                record.module_path,
-                record.part.label()
+                module_path,
+                part.label()
             )
             .into());
         }
+
+        let expected = match reader.read_state("expected state")? {
+            STATE_ABSENT => ExpectedState::Absent,
+            STATE_PRESENT => {
+                let mut hash = [0; SHA256_LEN];
+                hash.copy_from_slice(reader.read_exact(SHA256_LEN, "expected SHA-256")?);
+                ExpectedState::Sha256(hash)
+            }
+            state => return Err(format!("invalid expected state: {state}").into()),
+        };
+        let replacement = match reader.read_state("replacement state")? {
+            STATE_ABSENT => PatchBytes::Absent,
+            STATE_PRESENT => PatchBytes::Present(reader.read_bytes("replacement")?.to_vec()),
+            state => return Err(format!("invalid replacement state: {state}").into()),
+        };
+        records.push(PatchRecord {
+            module_path,
+            part,
+            expected,
+            replacement,
+        });
     }
 
+    reader.finish()?;
     Ok(PatchBundle {
         original_path,
         records,
     })
 }
 
-#[derive(Default)]
-struct PendingRecord {
-    module_path: Option<String>,
-    part: Option<PatchPartKind>,
-    expected: Option<PatchBytes>,
-    replacement: Option<PatchBytes>,
+struct PatchReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
 }
 
-impl PendingRecord {
-    fn set(&mut self, key: &str, value: &str, line_no: usize) -> Result<(), Box<dyn Error>> {
-        match key {
-            "module-path" => {
-                self.module_path = Some(String::from_utf8(hex_decode(value)?)?);
-            }
-            "part" => {
-                self.part = PatchPartKind::parse(value)
-                    .ok_or_else(|| format!("invalid patch part on line {line_no}: {value}"))?
-                    .into();
-            }
-            "expected" => {
-                self.expected = Some(PatchBytes::parse(value)?);
-            }
-            "replacement" => {
-                self.replacement = Some(PatchBytes::parse(value)?);
-            }
-            _ => {
-                return Err(
-                    format!("unknown patch record field on line {}: {}", line_no, key).into(),
-                );
-            }
-        }
+impl<'a> PatchReader<'a> {
+    const fn new(bytes: &'a [u8], offset: usize) -> Self {
+        Self { bytes, offset }
+    }
 
+    fn read_state(&mut self, field: &str) -> Result<u8, Box<dyn Error>> {
+        Ok(self.read_exact(1, field)?[0])
+    }
+
+    fn read_u32(&mut self, field: &str) -> Result<u32, Box<dyn Error>> {
+        let bytes: [u8; 4] = self
+            .read_exact(size_of::<u32>(), field)?
+            .try_into()
+            .expect("read_exact returned the requested length");
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn read_bytes(&mut self, field: &str) -> Result<&'a [u8], Box<dyn Error>> {
+        let len = usize::try_from(self.read_u32(field)?)
+            .map_err(|_| format!("patch {field} length exceeded usize"))?;
+        self.read_exact(len, field)
+    }
+
+    fn read_string(&mut self, field: &str) -> Result<String, Box<dyn Error>> {
+        let bytes = self.read_bytes(field)?;
+        let value =
+            std::str::from_utf8(bytes).map_err(|_| format!("patch {field} is not valid UTF-8"))?;
+        Ok(value.to_string())
+    }
+
+    fn read_exact(&mut self, len: usize, field: &str) -> Result<&'a [u8], Box<dyn Error>> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| format!("patch {field} length overflowed"))?;
+        let bytes = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| format!("patch ended while reading {field} at byte {}", self.offset))?;
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn finish(self) -> Result<(), Box<dyn Error>> {
+        if self.offset != self.bytes.len() {
+            return Err(format!(
+                "patch contains {} trailing bytes",
+                self.bytes.len() - self.offset
+            )
+            .into());
+        }
         Ok(())
     }
+}
 
-    fn finish(self, line_no: usize) -> Result<PatchRecord, Box<dyn Error>> {
-        Ok(PatchRecord {
-            module_path: self.module_path.ok_or_else(|| {
-                format!(
-                    "patch record ending near line {} is missing module-path",
-                    line_no
-                )
-            })?,
-            part: self.part.ok_or_else(|| {
-                format!("patch record ending near line {} is missing part", line_no)
-            })?,
-            expected: self.expected.ok_or_else(|| {
-                format!(
-                    "patch record ending near line {} is missing expected bytes",
-                    line_no
-                )
-            })?,
-            replacement: self.replacement.ok_or_else(|| {
-                format!(
-                    "patch record ending near line {} is missing replacement bytes",
-                    line_no
-                )
-            })?,
-        })
+const fn module_part_tag(part: ModulePart) -> u8 {
+    match part {
+        ModulePart::Contents => 0,
+        ModulePart::SourceMap => 1,
+        ModulePart::Bytecode => 2,
+        ModulePart::ModuleInfo => 3,
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(hex_digit(byte >> 4));
-        out.push(hex_digit(byte & 0x0f));
-    }
-    out
-}
-
-fn hex_digit(value: u8) -> char {
-    match value {
-        0..=9 => (b'0' + value) as char,
-        10..=15 => (b'a' + (value - 10)) as char,
-        _ => unreachable!("hex digit overflow"),
+const fn module_part_from_tag(tag: u8) -> Option<ModulePart> {
+    match tag {
+        0 => Some(ModulePart::Contents),
+        1 => Some(ModulePart::SourceMap),
+        2 => Some(ModulePart::Bytecode),
+        3 => Some(ModulePart::ModuleInfo),
+        _ => None,
     }
 }
 
-fn hex_decode(value: &str) -> Result<Vec<u8>, Box<dyn Error>> {
-    if !value.len().is_multiple_of(2) {
-        return Err(format!("hex field had odd length: {}", value.len()).into());
-    }
-
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut index = 0;
-    while index < bytes.len() {
-        let high = decode_hex_nibble(bytes[index])?;
-        let low = decode_hex_nibble(bytes[index + 1])?;
-        out.push((high << 4) | low);
-        index += 2;
-    }
-    Ok(out)
-}
-
-fn decode_hex_nibble(value: u8) -> Result<u8, Box<dyn Error>> {
-    match value {
-        b'0'..=b'9' => Ok(value - b'0'),
-        b'a'..=b'f' => Ok(value - b'a' + 10),
-        b'A'..=b'F' => Ok(value - b'A' + 10),
-        _ => Err(format!("invalid hex digit: {}", value as char).into()),
-    }
+fn sha256(bytes: &[u8]) -> [u8; SHA256_LEN] {
+    Sha256::digest(bytes).into()
 }
 
 #[cfg(test)]
@@ -737,15 +539,43 @@ mod tests {
             original_path: Some("/tmp/app-binary".to_string()),
             records: vec![PatchRecord {
                 module_path: "/$bunfs/root/app.js".to_string(),
-                part: PatchPartKind::Contents,
-                expected: PatchBytes::Present(b"before".to_vec()),
+                part: ModulePart::Contents,
+                expected: ExpectedState::Sha256(sha256(b"before")),
                 replacement: PatchBytes::Present(b"after".to_vec()),
             }],
         };
 
-        let parsed = parse_patch_bundle(render_patch_bundle(&bundle).as_bytes()).unwrap();
+        let mut encoded = Vec::new();
+        write_patch_bundle(&mut encoded, &bundle).unwrap();
+        let parsed = parse_patch_bundle(&encoded).unwrap();
         assert_eq!(parsed.original_path, bundle.original_path);
         assert_eq!(parsed.records, bundle.records);
+    }
+
+    #[test]
+    fn rejects_truncated_legacy_and_duplicate_patches() {
+        let truncated = parse_patch_bundle(PATCH_MAGIC).expect_err("header alone is incomplete");
+        assert!(truncated.to_string().contains("original path state"));
+
+        let legacy = parse_patch_bundle(b"debun-patch/v1\nrecord-count=0\n")
+            .expect_err("v1 must not be accepted after the hard cutover");
+        assert!(legacy.to_string().contains("unsupported patch file header"));
+
+        let record = || PatchRecord {
+            module_path: "/$bunfs/root/app.js".to_string(),
+            part: ModulePart::Contents,
+            expected: ExpectedState::Absent,
+            replacement: PatchBytes::Present(b"after".to_vec()),
+        };
+        let bundle = PatchBundle {
+            original_path: None,
+            records: vec![record(), record()],
+        };
+        let mut encoded = Vec::new();
+        write_patch_bundle(&mut encoded, &bundle).unwrap();
+        let duplicate =
+            parse_patch_bundle(&encoded).expect_err("duplicate records must be rejected");
+        assert!(duplicate.to_string().contains("duplicate record"));
     }
 
     #[test]
@@ -764,6 +594,7 @@ mod tests {
         let base_binary = temp.path.join("app-binary");
         let patch_file = temp.path.join("app.patch");
         let output_binary = temp.path.join("app-binary.patched");
+        let mismatched_binary = temp.path.join("app-binary.mismatched");
         fs::create_dir_all(workspace.join("embedded/files/$bunfs/root")).unwrap();
         fs::create_dir_all(support_dir(&workspace)).unwrap();
         fs::write(&base_binary, &exe).unwrap();
@@ -790,6 +621,26 @@ mod tests {
         assert_eq!(summary.record_counts.contents, 1);
         assert_eq!(summary.record_counts.sourcemaps, 1);
         assert_eq!(summary.record_counts.module_infos, 0);
+        assert!(fs::read(&patch_file).unwrap().starts_with(PATCH_MAGIC));
+
+        let mismatched_payload = build_payload(&[TestModule {
+            name: "/$bunfs/root/app.js",
+            contents: b"// @bun\nconsole.log('different base');\n",
+            sourcemap: b"SMAP",
+            bytecode: b"",
+            module_info: b"META",
+        }]);
+        let (mismatched_exe, _) = build_appended_executable(&mismatched_payload);
+        fs::write(&mismatched_binary, mismatched_exe).unwrap();
+        let mismatch = apply_patch(&ApplyPatchConfig {
+            patch_file: patch_file.clone(),
+            input: Some(mismatched_binary),
+            out_file: Some(temp.path.join("mismatch-output")),
+        });
+        let Err(mismatch) = mismatch else {
+            panic!("the expected SHA-256 must reject a different base module");
+        };
+        assert!(mismatch.to_string().contains("does not apply cleanly"));
 
         let apply_summary = apply_patch(&ApplyPatchConfig {
             patch_file,

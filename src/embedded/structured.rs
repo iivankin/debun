@@ -64,9 +64,7 @@ pub(super) fn structured_embedded_files<'a>(
     let mut extracted = Vec::new();
 
     for module in modules {
-        let Some(kind) = detect_kind(&module.virtual_path, &module.bytes) else {
-            continue;
-        };
+        let kind = detect_kind(&module.virtual_path, &module.bytes).unwrap_or(EmbeddedKind::Binary);
         let context = StandaloneFileContext::new(module);
 
         extracted.push(context.build_file(StandaloneFileSpec {

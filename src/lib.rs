@@ -8,10 +8,12 @@ mod output;
 mod pack;
 mod pack_support;
 mod patch;
+mod replacement_workspace;
 mod rewrite;
 mod split;
 mod standalone;
 mod standalone_decode;
+mod workspace_path;
 
 use std::{error::Error, fs};
 
@@ -36,13 +38,13 @@ fn run_unpack(config: &Config) -> Result<(), Box<dyn Error>> {
     print_header(config);
 
     print_phase(1, 3, "inspect");
-    let binary_inspection = inspect_binary(&config.input)?;
+    let mut binary_inspection = inspect_binary(&config.input)?;
     print_inspection_details(binary_inspection.as_ref());
 
     print_phase(2, 3, "transform");
     let extracted_source = if let Some(source) = binary_inspection
-        .as_ref()
-        .and_then(|inspection| inspection.entry_point_source.clone())
+        .as_mut()
+        .and_then(|inspection| inspection.entry_point_source.take())
     {
         ExtractedSource::from_source(source)
     } else {

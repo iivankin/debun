@@ -1,16 +1,11 @@
 use std::{collections::HashMap, error::Error, mem::size_of};
 
-use super::OptionalReplacement;
 use super::{
-    ModuleRecordLayout, RepackedExecutable, ReplacementCounts, ReplacementParts,
-    RequiredReplacement, StandaloneInspection, StandaloneModule, TRAILER,
+    ModuleRecordLayout, OffsetsLayout, OptionalReplacement, RawStringPointer, RepackedExecutable,
+    ReplacementCounts, ReplacementParts, RequiredReplacement, SectionLengthWidth,
+    StandaloneContainer, StandaloneInspection, StandaloneModule, StandaloneSectionKind, TRAILER,
+    elf, macho, pe,
 };
-
-#[derive(Debug, Clone, Copy)]
-struct RawStringPointer {
-    offset: u32,
-    length: u32,
-}
 
 #[derive(Debug, Clone, Copy)]
 struct ResolvedRequiredPart<'a> {
@@ -118,52 +113,85 @@ pub(super) fn repack_executable(
     inspection: StandaloneInspection,
     replacements: &HashMap<String, ReplacementParts>,
 ) -> Result<RepackedExecutable, Box<dyn Error>> {
+    let (payload, replacement_counts) = serialize_payload(&inspection, replacements)?;
+    let bytes = write_container(original_bytes, &inspection.container, &payload)?;
+
+    Ok(RepackedExecutable {
+        bytes,
+        replacement_counts,
+    })
+}
+
+fn serialize_payload(
+    inspection: &StandaloneInspection,
+    replacements: &HashMap<String, ReplacementParts>,
+) -> Result<(Vec<u8>, ReplacementCounts), Box<dyn Error>> {
     let mut body = Vec::new();
-    let compile_exec_argv_ptr =
-        push_optional_bytes(&mut body, inspection.compile_exec_argv.as_deref())?;
+    let compile_exec_argv_ptr = match inspection.offsets_layout {
+        OffsetsLayout::Legacy => {
+            if inspection.compile_exec_argv.is_some() {
+                return Err("legacy standalone offsets cannot store compile argv".into());
+            }
+            RawStringPointer::EMPTY
+        }
+        OffsetsLayout::WithCompileArgv => {
+            push_optional_bytes_z(&mut body, inspection.compile_exec_argv.as_deref())?
+        }
+    };
     let record_layout = inspection.record_layout;
     let record_size = record_layout.size();
     let mut modules = Vec::with_capacity(inspection.modules.len() * record_size);
 
     let mut replacement_counts = ReplacementCounts::default();
 
-    for module in inspection.modules {
-        let parts = ResolvedModuleParts::new(&module, replacements.get(&module.virtual_path));
+    for module in &inspection.modules {
+        let parts = ResolvedModuleParts::new(module, replacements.get(&module.virtual_path));
         parts.record(&mut replacement_counts);
 
-        let name_ptr = push_bytes(&mut body, module.original_path.as_bytes())?;
-        let contents_ptr = push_bytes(&mut body, parts.contents.bytes)?;
+        let name_ptr = push_bytes_z(&mut body, module.original_path.as_bytes())?;
+        let contents_ptr = push_bytes_z(&mut body, parts.contents.bytes)?;
         let sourcemap_ptr = push_optional_bytes(&mut body, parts.sourcemap.bytes)?;
-        let bytecode_ptr = push_optional_bytes(&mut body, parts.bytecode.bytes)?;
 
         push_string_pointer(&mut modules, name_ptr);
         push_string_pointer(&mut modules, contents_ptr);
         push_string_pointer(&mut modules, sourcemap_ptr);
-        push_string_pointer(&mut modules, bytecode_ptr);
 
         match record_layout {
-            ModuleRecordLayout::Compact => {}
+            ModuleRecordLayout::LegacyLoader => {
+                reject_unsupported_legacy_parts(parts)?;
+                modules.push(module.loader);
+                modules.extend_from_slice(&[0; 7]);
+            }
+            ModuleRecordLayout::LegacyEncoding => {
+                reject_unsupported_legacy_parts(parts)?;
+                modules.extend_from_slice(&[module.encoding, module.loader, 0, 0]);
+            }
+            ModuleRecordLayout::Compact => {
+                let bytecode_ptr = push_optional_bytes(&mut body, parts.bytecode.bytes)?;
+                push_string_pointer(&mut modules, bytecode_ptr);
+                push_module_tail(&mut modules, module);
+            }
             ModuleRecordLayout::WithModuleInfo => {
+                let bytecode_ptr = push_optional_bytes(&mut body, parts.bytecode.bytes)?;
                 let module_info_ptr = push_optional_bytes(&mut body, parts.module_info.bytes)?;
+                push_string_pointer(&mut modules, bytecode_ptr);
                 push_string_pointer(&mut modules, module_info_ptr);
+                push_module_tail(&mut modules, module);
             }
             ModuleRecordLayout::Extended => {
+                let bytecode_ptr = push_optional_bytes(&mut body, parts.bytecode.bytes)?;
                 let module_info_ptr = push_optional_bytes(&mut body, parts.module_info.bytes)?;
-                let origin_ptr = push_optional_bytes(
+                let origin_ptr = push_optional_bytes_z(
                     &mut body,
                     module.bytecode_origin_path.as_deref().map(str::as_bytes),
                 )?;
+                push_string_pointer(&mut modules, bytecode_ptr);
                 push_string_pointer(&mut modules, module_info_ptr);
                 push_string_pointer(&mut modules, origin_ptr);
+                push_module_tail(&mut modules, module);
             }
         }
 
-        modules.extend_from_slice(&[
-            module.encoding,
-            module.loader,
-            module.module_format,
-            module.side,
-        ]);
         debug_assert_eq!(modules.len() % record_size, 0);
     }
 
@@ -185,23 +213,55 @@ pub(super) fn repack_executable(
         },
     );
     payload.extend_from_slice(&inspection.entry_point_id.to_le_bytes());
-    push_string_pointer(&mut payload, compile_exec_argv_ptr);
-    payload.extend_from_slice(&inspection.flags_bits.to_le_bytes());
+    match inspection.offsets_layout {
+        OffsetsLayout::Legacy => payload.extend_from_slice(&[0; 4]),
+        OffsetsLayout::WithCompileArgv => {
+            push_string_pointer(&mut payload, compile_exec_argv_ptr);
+            payload.extend_from_slice(&inspection.flags_bits.to_le_bytes());
+        }
+    }
     payload.extend_from_slice(TRAILER);
 
-    let bytes = if let (Some(raw_offset), Some(raw_container)) = (
-        inspection.raw_container_file_offset,
-        inspection.raw_container_bytes.as_ref(),
-    ) {
-        write_sectioned_executable(original_bytes, raw_offset, raw_container.len(), &payload)?
-    } else {
-        write_appended_executable(original_bytes, inspection.payload_file_offset, &payload)?
-    };
+    Ok((payload, replacement_counts))
+}
 
-    Ok(RepackedExecutable {
-        bytes,
-        replacement_counts,
-    })
+fn write_container(
+    original_bytes: &[u8],
+    container: &StandaloneContainer,
+    payload: &[u8],
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    match container {
+        StandaloneContainer::Appended {
+            payload_file_offset,
+        } => write_appended_executable(original_bytes, *payload_file_offset, payload),
+        StandaloneContainer::Section {
+            kind,
+            file_offset,
+            bytes,
+            length_width,
+            ..
+        } => match kind {
+            StandaloneSectionKind::Elf => {
+                elf::write_bun_section(original_bytes, payload, *length_width)
+            }
+            StandaloneSectionKind::MachO64 => {
+                macho::write_bun_section(original_bytes, payload, *length_width)
+            }
+            StandaloneSectionKind::Pe64 => {
+                pe::write_bun_section(original_bytes, payload, *length_width)
+            }
+            StandaloneSectionKind::Pe32 => {
+                pe::write_bun_section(original_bytes, payload, *length_width)
+            }
+            StandaloneSectionKind::MachO32 => write_sectioned_executable(
+                original_bytes,
+                *file_offset,
+                bytes.len(),
+                payload,
+                *length_width,
+            ),
+        },
+    }
 }
 
 fn write_sectioned_executable(
@@ -209,8 +269,10 @@ fn write_sectioned_executable(
     raw_offset: usize,
     raw_container_len: usize,
     payload: &[u8],
+    length_width: SectionLengthWidth,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
-    let required_len = size_of::<u64>()
+    let required_len = length_width
+        .size()
         .checked_add(payload.len())
         .ok_or("standalone section payload size overflowed")?;
     if required_len > raw_container_len {
@@ -229,15 +291,28 @@ fn write_sectioned_executable(
 
     let mut out = original_bytes.to_vec();
     let mut raw_section = Vec::with_capacity(raw_container_len);
-    raw_section.extend_from_slice(
-        &u64::try_from(payload.len())
-            .map_err(|_| "standalone payload length exceeded u64")?
-            .to_le_bytes(),
-    );
+    raw_section.resize(length_width.size(), 0);
+    length_width.write(&mut raw_section, payload.len())?;
     raw_section.extend_from_slice(payload);
     raw_section.resize(raw_container_len, 0);
     out[raw_offset..end].copy_from_slice(&raw_section);
     Ok(out)
+}
+
+fn reject_unsupported_legacy_parts(parts: ResolvedModuleParts<'_>) -> Result<(), Box<dyn Error>> {
+    if parts.bytecode.bytes.is_some() || parts.module_info.bytes.is_some() {
+        return Err("legacy standalone module records cannot store bytecode or module info".into());
+    }
+    Ok(())
+}
+
+fn push_module_tail(out: &mut Vec<u8>, module: &StandaloneModule) {
+    out.extend_from_slice(&[
+        module.encoding,
+        module.loader,
+        module.module_format,
+        module.side,
+    ]);
 }
 
 fn write_appended_executable(
@@ -278,16 +353,29 @@ fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<RawStringPointer, Box<d
     Ok(RawStringPointer { offset, length })
 }
 
+fn push_bytes_z(out: &mut Vec<u8>, bytes: &[u8]) -> Result<RawStringPointer, Box<dyn Error>> {
+    let pointer = push_bytes(out, bytes)?;
+    out.push(0);
+    Ok(pointer)
+}
+
 fn push_optional_bytes(
     out: &mut Vec<u8>,
     bytes: Option<&[u8]>,
 ) -> Result<RawStringPointer, Box<dyn Error>> {
     match bytes {
         Some(bytes) => push_bytes(out, bytes),
-        None => Ok(RawStringPointer {
-            offset: 0,
-            length: 0,
-        }),
+        None => Ok(RawStringPointer::EMPTY),
+    }
+}
+
+fn push_optional_bytes_z(
+    out: &mut Vec<u8>,
+    bytes: Option<&[u8]>,
+) -> Result<RawStringPointer, Box<dyn Error>> {
+    match bytes {
+        Some(bytes) => push_bytes_z(out, bytes),
+        None => Ok(RawStringPointer::EMPTY),
     }
 }
 

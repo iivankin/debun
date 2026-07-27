@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
 use super::layout::{
-    MODULE_RECORD_SIZE_COMPACT, MODULE_RECORD_SIZE_EXTENDED, MODULE_RECORD_SIZE_WITH_MODULE_INFO,
+    MODULE_RECORD_SIZE_COMPACT, MODULE_RECORD_SIZE_EXTENDED, MODULE_RECORD_SIZE_LEGACY_ENCODING,
+    MODULE_RECORD_SIZE_LEGACY_LOADER, MODULE_RECORD_SIZE_WITH_MODULE_INFO, OffsetsLayout,
 };
 use super::{
-    OFFSETS_SIZE_64, OptionalReplacement, ReplacementParts, RequiredReplacement, TRAILER,
-    inspect_executable, repack_executable,
+    OptionalReplacement, ReplacementParts, RequiredReplacement, TRAILER, inspect_executable,
+    repack_executable,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -30,6 +31,8 @@ struct TestModulePointers {
 
 #[derive(Debug, Clone, Copy)]
 enum TestModuleRecordLayout {
+    LegacyLoader,
+    LegacyEncoding,
     Compact,
     WithModuleInfo,
     Extended,
@@ -38,6 +41,8 @@ enum TestModuleRecordLayout {
 impl TestModuleRecordLayout {
     const fn size(self) -> usize {
         match self {
+            Self::LegacyLoader => MODULE_RECORD_SIZE_LEGACY_LOADER,
+            Self::LegacyEncoding => MODULE_RECORD_SIZE_LEGACY_ENCODING,
             Self::Compact => MODULE_RECORD_SIZE_COMPACT,
             Self::WithModuleInfo => MODULE_RECORD_SIZE_WITH_MODULE_INFO,
             Self::Extended => MODULE_RECORD_SIZE_EXTENDED,
@@ -64,19 +69,31 @@ fn push_module_record(
     push_string_pointer(out, pointers.name.0, pointers.name.1);
     push_string_pointer(out, pointers.contents.0, pointers.contents.1);
     push_string_pointer(out, pointers.sourcemap.0, pointers.sourcemap.1);
-    push_string_pointer(out, pointers.bytecode.0, pointers.bytecode.1);
     match layout {
-        TestModuleRecordLayout::Compact => {}
+        TestModuleRecordLayout::LegacyLoader => {
+            out.push(1);
+            out.extend_from_slice(&[0; 7]);
+        }
+        TestModuleRecordLayout::LegacyEncoding => {
+            out.extend_from_slice(&[1, 1, 0, 0]);
+        }
+        TestModuleRecordLayout::Compact => {
+            push_string_pointer(out, pointers.bytecode.0, pointers.bytecode.1);
+            out.extend_from_slice(&[1, 1, 1, 0]);
+        }
         TestModuleRecordLayout::WithModuleInfo => {
+            push_string_pointer(out, pointers.bytecode.0, pointers.bytecode.1);
             push_string_pointer(out, pointers.module_info.0, pointers.module_info.1);
+            out.extend_from_slice(&[1, 1, 1, 0]);
         }
         TestModuleRecordLayout::Extended => {
+            push_string_pointer(out, pointers.bytecode.0, pointers.bytecode.1);
             push_string_pointer(out, pointers.module_info.0, pointers.module_info.1);
             let origin = pointers.bytecode_origin_path.unwrap_or((0, 0));
             push_string_pointer(out, origin.0, origin.1);
+            out.extend_from_slice(&[1, 1, 1, 0]);
         }
     }
-    out.extend_from_slice(&[1, 1, 1, 0]);
     assert_eq!(out.len() % layout.size(), 0);
 }
 
@@ -86,6 +103,17 @@ fn to_u32(value: usize) -> u32 {
 
 fn to_u64(value: usize) -> u64 {
     u64::try_from(value).expect("test payload exceeded u64")
+}
+
+pub(super) fn build_container_payload(body_len: usize, fill: u8) -> Vec<u8> {
+    let mut payload = vec![fill; body_len];
+    payload.extend_from_slice(&to_u64(body_len).to_le_bytes());
+    push_string_pointer(&mut payload, 0, 0);
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    push_string_pointer(&mut payload, 0, 0);
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(TRAILER);
+    payload
 }
 
 fn build_appended_executable(payload: &[u8]) -> (Vec<u8>, usize) {
@@ -104,6 +132,20 @@ fn build_payload(
     files: &[TestModule<'_>],
     entry_point_id: u32,
     layout: TestModuleRecordLayout,
+) -> Vec<u8> {
+    build_payload_with_offsets(
+        files,
+        entry_point_id,
+        layout,
+        OffsetsLayout::WithCompileArgv,
+    )
+}
+
+fn build_payload_with_offsets(
+    files: &[TestModule<'_>],
+    entry_point_id: u32,
+    layout: TestModuleRecordLayout,
+    offsets_layout: OffsetsLayout,
 ) -> Vec<u8> {
     let mut body = Vec::new();
     let mut modules = Vec::new();
@@ -139,11 +181,19 @@ fn build_payload(
     payload.extend_from_slice(&to_u64(byte_count).to_le_bytes());
     push_string_pointer(&mut payload, modules_offset, to_u32(modules.len()));
     payload.extend_from_slice(&entry_point_id.to_le_bytes());
-    push_string_pointer(&mut payload, 0, 0);
-    payload.extend_from_slice(&0u32.to_le_bytes());
+    match offsets_layout {
+        OffsetsLayout::Legacy => payload.extend_from_slice(&0u32.to_le_bytes()),
+        OffsetsLayout::WithCompileArgv => {
+            push_string_pointer(&mut payload, 0, 0);
+            payload.extend_from_slice(&0u32.to_le_bytes());
+        }
+    }
     payload.extend_from_slice(TRAILER);
 
-    assert_eq!(payload.len(), byte_count + OFFSETS_SIZE_64 + TRAILER.len());
+    assert_eq!(
+        payload.len(),
+        byte_count + offsets_layout.size() + TRAILER.len()
+    );
     payload
 }
 
@@ -182,7 +232,7 @@ fn parses_appended_standalone_graph_with_extended_records() {
         panic!("expected two bunfs files");
     };
 
-    assert_eq!(inspection.payload_file_offset, payload_offset);
+    assert_eq!(inspection.container.payload_file_offset(), payload_offset);
     assert_eq!(inspection.record_layout_label(), "extended");
     assert_eq!(entry.virtual_path, "/$bunfs/root/app.js");
     assert_eq!(chunk.virtual_path, "/$bunfs/root/chunk.wasm");
@@ -280,7 +330,7 @@ fn parses_appended_standalone_graph_with_compact_records() {
         panic!("expected two bunfs files");
     };
 
-    assert_eq!(inspection.payload_file_offset, payload_offset);
+    assert_eq!(inspection.container.payload_file_offset(), payload_offset);
     assert_eq!(inspection.record_layout_label(), "compact");
     assert_eq!(entry.virtual_path, "/$bunfs/root/app.js");
     assert_eq!(chunk.virtual_path, "/$bunfs/root/chunk.wasm");
@@ -295,6 +345,94 @@ fn parses_appended_standalone_graph_with_compact_records() {
     assert_eq!(entry.sourcemap.as_deref(), Some(b"SMAP".as_slice()));
     assert_eq!(entry.bytecode.as_deref(), Some(b"BYTE".as_slice()));
     assert_eq!(entry.module_info, None);
+}
+
+#[test]
+fn preserves_modules_with_empty_contents() {
+    let payload = build_payload(
+        &[TestModule {
+            name: "/$bunfs/root/empty.txt",
+            contents: b"",
+            sourcemap: b"",
+            bytecode: b"",
+            module_info: b"",
+            bytecode_origin_path: None,
+        }],
+        0,
+        TestModuleRecordLayout::Compact,
+    );
+    let (exe, _) = build_appended_executable(&payload);
+
+    let inspection = inspect_executable(&exe)
+        .expect("parser should not fail")
+        .expect("parser should find an appended payload");
+    let module = inspection
+        .bunfs_modules()
+        .next()
+        .expect("empty module should not be discarded");
+
+    assert!(module.bytes.is_empty());
+}
+
+#[test]
+fn rejects_module_paths_that_collide_after_normalization() {
+    let payload = build_payload(
+        &[
+            TestModule {
+                name: "/$bunfs/root/app.js",
+                contents: b"console.log('first');",
+                sourcemap: b"",
+                bytecode: b"",
+                module_info: b"",
+                bytecode_origin_path: None,
+            },
+            TestModule {
+                name: "B:/~BUN/root/app.js",
+                contents: b"console.log('second');",
+                sourcemap: b"",
+                bytecode: b"",
+                module_info: b"",
+                bytecode_origin_path: None,
+            },
+        ],
+        0,
+        TestModuleRecordLayout::Compact,
+    );
+    let (exe, _) = build_appended_executable(&payload);
+
+    let error = inspect_executable(&exe).expect_err("normalized module paths must be unique");
+
+    assert!(error.to_string().contains("duplicate module path"));
+}
+
+#[test]
+fn rejects_nonempty_optional_parts_with_invalid_pointers() {
+    let mut payload = build_payload(
+        &[TestModule {
+            name: "/$bunfs/root/app.js",
+            contents: b"console.log('ok');",
+            sourcemap: b"SMAP",
+            bytecode: b"",
+            module_info: b"",
+            bytecode_origin_path: None,
+        }],
+        0,
+        TestModuleRecordLayout::Compact,
+    );
+    let offsets_start = payload.len() - TRAILER.len() - OffsetsLayout::WithCompileArgv.size();
+    let modules_offset = usize::try_from(u32::from_le_bytes(
+        payload[offsets_start + 8..offsets_start + 12]
+            .try_into()
+            .unwrap(),
+    ))
+    .unwrap();
+    payload[modules_offset + 16..modules_offset + 20].copy_from_slice(&u32::MAX.to_le_bytes());
+    payload[modules_offset + 20..modules_offset + 24].copy_from_slice(&1_u32.to_le_bytes());
+    let (exe, _) = build_appended_executable(&payload);
+
+    let error = inspect_executable(&exe).expect_err("invalid sourcemap pointer should be rejected");
+
+    assert!(error.to_string().contains("record layout"));
 }
 
 #[test]
@@ -360,6 +498,22 @@ fn repacks_appended_standalone_graph_with_replacements() {
     assert_eq!(entry.sourcemap.as_deref(), Some(b"NEW-SMAP".as_slice()));
     assert_eq!(entry.bytecode.as_deref(), Some(b"BYTE".as_slice()));
     assert_eq!(entry.module_info.as_deref(), Some(b"NEW-META".as_slice()));
+    let payload_start = patched.container.payload_file_offset();
+    assert_eq!(
+        repacked.bytes[payload_start + entry.original_path.len()],
+        0,
+        "module names must keep Bun's trailing sentinel"
+    );
+    assert_eq!(
+        repacked.bytes[payload_start + entry.source_offset - 1],
+        0,
+        "module contents must start after a trailing name sentinel"
+    );
+    assert_eq!(
+        repacked.bytes[payload_start + entry.source_offset + entry.bytes.len()],
+        0,
+        "module contents must keep Bun's trailing sentinel"
+    );
 }
 
 #[test]
@@ -407,4 +561,109 @@ fn repacks_appended_standalone_graph_with_removed_optional_parts() {
     assert_eq!(entry.sourcemap, None);
     assert_eq!(entry.bytecode.as_deref(), Some(b"BYTE".as_slice()));
     assert_eq!(entry.module_info, None);
+}
+
+#[test]
+fn repacks_legacy_loader_records_and_compiled_root_paths() {
+    let payload = build_payload_with_offsets(
+        &[TestModule {
+            name: "compiled://root/app.js",
+            contents: b"console.log('legacy loader');\n",
+            sourcemap: b"SMAP",
+            bytecode: b"",
+            module_info: b"",
+            bytecode_origin_path: None,
+        }],
+        0,
+        TestModuleRecordLayout::LegacyLoader,
+        OffsetsLayout::Legacy,
+    );
+    let (exe, _) = build_appended_executable(&payload);
+    let inspection = inspect_executable(&exe)
+        .expect("parser should not fail")
+        .expect("parser should find the legacy payload");
+    let entry = inspection
+        .bunfs_modules()
+        .next()
+        .expect("legacy path should be exposed through bunfs");
+
+    assert_eq!(inspection.record_layout_label(), "legacy-loader");
+    assert_eq!(inspection.offsets_layout, OffsetsLayout::Legacy);
+    assert_eq!(entry.original_path, "compiled://root/app.js");
+    assert_eq!(entry.virtual_path, "/$bunfs/root/app.js");
+
+    let mut replacements = HashMap::new();
+    replacements.insert(
+        "/$bunfs/root/app.js".to_string(),
+        ReplacementParts {
+            contents: RequiredReplacement::Replace(
+                b"console.log('legacy loader patched and larger');\n".to_vec(),
+            ),
+            sourcemap: OptionalReplacement::Replace(b"NEW-SMAP".to_vec()),
+            bytecode: OptionalReplacement::Keep,
+            module_info: OptionalReplacement::Keep,
+        },
+    );
+
+    let repacked =
+        repack_executable(&exe, inspection, &replacements).expect("legacy repack should succeed");
+    let patched = inspect_executable(&repacked.bytes)
+        .expect("parser should not fail")
+        .expect("parser should find the repacked legacy payload");
+    let entry = patched.bunfs_modules().next().expect("expected bunfs file");
+
+    assert_eq!(patched.record_layout_label(), "legacy-loader");
+    assert_eq!(patched.offsets_layout, OffsetsLayout::Legacy);
+    assert_eq!(entry.original_path, "compiled://root/app.js");
+    assert_eq!(
+        entry.bytes,
+        b"console.log('legacy loader patched and larger');\n"
+    );
+    assert_eq!(entry.sourcemap.as_deref(), Some(b"NEW-SMAP".as_slice()));
+}
+
+#[test]
+fn repacks_legacy_encoding_records() {
+    let payload = build_payload_with_offsets(
+        &[TestModule {
+            name: "/$bunfs/root/app.js",
+            contents: b"console.log('legacy encoding');\n",
+            sourcemap: b"",
+            bytecode: b"",
+            module_info: b"",
+            bytecode_origin_path: None,
+        }],
+        0,
+        TestModuleRecordLayout::LegacyEncoding,
+        OffsetsLayout::Legacy,
+    );
+    let (exe, _) = build_appended_executable(&payload);
+    let inspection = inspect_executable(&exe)
+        .expect("parser should not fail")
+        .expect("parser should find the legacy payload");
+
+    assert_eq!(inspection.record_layout_label(), "legacy-encoding");
+    assert_eq!(inspection.offsets_layout, OffsetsLayout::Legacy);
+
+    let mut replacements = HashMap::new();
+    replacements.insert(
+        "/$bunfs/root/app.js".to_string(),
+        ReplacementParts {
+            contents: RequiredReplacement::Replace(
+                b"console.log('legacy encoding patched');\n".to_vec(),
+            ),
+            ..ReplacementParts::default()
+        },
+    );
+
+    let repacked =
+        repack_executable(&exe, inspection, &replacements).expect("legacy repack should succeed");
+    let patched = inspect_executable(&repacked.bytes)
+        .expect("parser should not fail")
+        .expect("parser should find the repacked legacy payload");
+    let entry = patched.bunfs_modules().next().expect("expected bunfs file");
+
+    assert_eq!(patched.record_layout_label(), "legacy-encoding");
+    assert_eq!(patched.offsets_layout, OffsetsLayout::Legacy);
+    assert_eq!(entry.bytes, b"console.log('legacy encoding patched');\n");
 }

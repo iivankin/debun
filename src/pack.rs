@@ -8,11 +8,13 @@ use std::{
 use crate::{
     args::PackConfig,
     pack_support::{
-        base_executable_path, resign_if_needed, resolve_replacements_root, resolve_workspace_root,
+        base_executable_path, resolve_replacements_root, resolve_workspace_root,
+        write_repacked_executable,
     },
+    replacement_workspace::{ModulePart, read_module_part, validate_workspace_files},
     standalone::{
         OptionalReplacement, ReplacementCounts, ReplacementParts, RequiredReplacement,
-        StandaloneModule, StandaloneSidecarKind, inspect_executable, repack_executable,
+        StandaloneModule, inspect_executable, repack_executable,
     },
 };
 
@@ -28,24 +30,28 @@ pub fn pack_binary(config: &PackConfig) -> Result<PackSummary, Box<dyn Error>> {
     let original_permissions = fs::metadata(&base_executable)?.permissions();
     let standalone = inspect_executable(&original_bytes)?
         .ok_or("pack only supports Bun standalone executables")?;
+    let section_backed_macho = standalone.container.is_macho_section();
     let replacements_root = resolve_replacements_root(&workspace_root)?;
+    validate_workspace_files(&replacements_root, standalone.bunfs_modules())?;
     let replacements = collect_replacements(&replacements_root, standalone.bunfs_modules())?;
-    let repacked = repack_executable(&original_bytes, standalone, &replacements)?;
+    let modified = !replacements.is_empty();
+    let (output_bytes, replacement_counts) = if modified {
+        let repacked = repack_executable(&original_bytes, standalone, &replacements)?;
+        (repacked.bytes, repacked.replacement_counts)
+    } else {
+        (original_bytes, ReplacementCounts::default())
+    };
 
-    if let Some(parent) = config
-        .out_file
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&config.out_file, repacked.bytes)?;
-    fs::set_permissions(&config.out_file, original_permissions)?;
-    resign_if_needed(&config.out_file)?;
+    write_repacked_executable(
+        &config.out_file,
+        &output_bytes,
+        original_permissions,
+        section_backed_macho && modified,
+    )?;
 
     Ok(PackSummary {
         replacements_root,
-        replacement_counts: repacked.replacement_counts,
+        replacement_counts,
     })
 }
 
@@ -56,26 +62,25 @@ fn collect_replacements<'a>(
     let mut replacements = HashMap::new();
 
     for module in modules {
-        let contents = read_if_exists(root, &module.virtual_path)?;
-        let sourcemap = read_if_exists(
-            root,
-            &module.sidecar_path(StandaloneSidecarKind::SourceMapBinary),
-        )?;
-        let bytecode = read_if_exists(
-            root,
-            &module.sidecar_path(StandaloneSidecarKind::BytecodeBinary),
-        )?;
-        let module_info = read_if_exists(
-            root,
-            &module.sidecar_path(StandaloneSidecarKind::ModuleInfoBinary),
-        )?;
+        let contents = read_module_part(root, module, ModulePart::Contents)?.ok_or_else(|| {
+            format!(
+                "workspace file {} is missing; pack cannot delete BunFS modules",
+                module.virtual_path
+            )
+        })?;
+        let sourcemap = read_module_part(root, module, ModulePart::SourceMap)?;
+        let bytecode = read_module_part(root, module, ModulePart::Bytecode)?;
+        let module_info = read_module_part(root, module, ModulePart::ModuleInfo)?;
 
         let replacement = ReplacementParts {
-            contents: contents.map_or(RequiredReplacement::Keep, RequiredReplacement::Replace),
-            sourcemap: sourcemap.map_or(OptionalReplacement::Keep, OptionalReplacement::Replace),
-            bytecode: bytecode.map_or(OptionalReplacement::Keep, OptionalReplacement::Replace),
-            module_info: module_info
-                .map_or(OptionalReplacement::Keep, OptionalReplacement::Replace),
+            contents: if contents == module.bytes {
+                RequiredReplacement::Keep
+            } else {
+                RequiredReplacement::Replace(contents)
+            },
+            sourcemap: optional_replacement(sourcemap, module.sourcemap.as_deref()),
+            bytecode: optional_replacement(bytecode, module.bytecode.as_deref()),
+            module_info: optional_replacement(module_info, module.module_info.as_deref()),
         };
         if replacement.is_empty() {
             continue;
@@ -87,11 +92,85 @@ fn collect_replacements<'a>(
     Ok(replacements)
 }
 
-fn read_if_exists(root: &Path, virtual_path: &str) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
-    let path = root.join(virtual_path.trim_start_matches('/'));
-    if !path.is_file() {
-        return Ok(None);
+fn optional_replacement(
+    candidate: Option<Vec<u8>>,
+    original: Option<&[u8]>,
+) -> OptionalReplacement {
+    match (candidate, original) {
+        (None, None) => OptionalReplacement::Keep,
+        (None, Some(_)) => OptionalReplacement::Remove,
+        (Some(bytes), Some(original)) if bytes == original => OptionalReplacement::Keep,
+        (Some(bytes), _) => OptionalReplacement::Replace(bytes),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    struct TestDir(PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
-    Ok(Some(fs::read(path)?))
+    #[test]
+    fn missing_optional_sidecar_removes_original_part() {
+        let root = test_dir("remove-sidecar");
+        let module = test_module();
+        let contents_path = root.0.join("$bunfs/root/app.js");
+        fs::create_dir_all(contents_path.parent().unwrap()).unwrap();
+        fs::write(contents_path, &module.bytes).unwrap();
+
+        let replacements = collect_replacements(&root.0, [&module]).unwrap();
+        let replacement = replacements.get(&module.virtual_path).unwrap();
+
+        assert_eq!(replacement.contents, RequiredReplacement::Keep);
+        assert_eq!(replacement.sourcemap, OptionalReplacement::Remove);
+    }
+
+    #[test]
+    fn missing_module_contents_is_an_error() {
+        let root = test_dir("missing-contents");
+        let module = test_module();
+
+        let error = collect_replacements(&root.0, [&module])
+            .expect_err("pack must not silently retain a missing module");
+
+        assert!(error.to_string().contains("cannot delete BunFS modules"));
+    }
+
+    fn test_module() -> StandaloneModule {
+        StandaloneModule {
+            original_path: "/$bunfs/root/app.js".to_string(),
+            virtual_path: "/$bunfs/root/app.js".to_string(),
+            source_offset: 0,
+            bytes: b"console.log('app');".to_vec(),
+            sourcemap: Some(b"SMAP".to_vec()),
+            sourcemap_offset: Some(20),
+            bytecode: None,
+            bytecode_offset: None,
+            module_info: None,
+            module_info_offset: None,
+            bytecode_origin_path: None,
+            encoding: 2,
+            loader: 1,
+            module_format: 1,
+            side: 0,
+        }
+    }
+
+    fn test_dir(label: &str) -> TestDir {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("debun-pack-{label}-{nonce}"));
+        fs::create_dir_all(&path).unwrap();
+        TestDir(path)
+    }
 }

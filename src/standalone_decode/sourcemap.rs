@@ -3,11 +3,12 @@ use std::{
     io::{Cursor, Read},
 };
 
-use crate::json::json_string;
+use crate::{binary::read_u32_le, json::json_string};
 use ruzstd::decoding::StreamingDecoder;
 
 const SOURCE_MAP_HEADER_SIZE: usize = 8;
 const STRING_POINTER_SIZE: usize = 8;
+const MAX_DECOMPRESSED_SOURCE_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct DecodedSourceMap {
@@ -117,10 +118,25 @@ pub fn decode_serialized_sourcemap(
 }
 
 fn decompress_zstd_frame(bytes: &[u8]) -> Result<String, Box<dyn Error>> {
-    let mut decoder = StreamingDecoder::new(Cursor::new(bytes))?;
+    let decoder = StreamingDecoder::new(Cursor::new(bytes))?;
+    let decompressed = read_to_end_limited(decoder, MAX_DECOMPRESSED_SOURCE_BYTES)?;
+    Ok(String::from_utf8(decompressed)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()))
+}
+
+fn read_to_end_limited(reader: impl Read, limit: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+    let read_limit = limit
+        .checked_add(1)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or("sourcemap decompression limit overflowed")?;
     let mut decompressed = Vec::new();
-    decoder.read_to_end(&mut decompressed)?;
-    Ok(String::from_utf8_lossy(&decompressed).into_owned())
+    reader.take(read_limit).read_to_end(&mut decompressed)?;
+    if decompressed.len() > limit {
+        return Err(
+            format!("decompressed sourcemap source exceeded the {limit}-byte limit").into(),
+        );
+    }
+    Ok(decompressed)
 }
 
 fn parse_string_pointer(bytes: &[u8]) -> Option<RawStringPointer> {
@@ -135,14 +151,11 @@ fn slice_pointer(bytes: &[u8], pointer: RawStringPointer) -> Option<&[u8]> {
     bytes.get(start..end)
 }
 
-fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
-    let chunk = bytes.get(offset..offset + 4)?;
-    Some(u32::from_le_bytes(chunk.try_into().ok()?))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::decode_serialized_sourcemap;
+    use std::io::Cursor;
+
+    use super::{decode_serialized_sourcemap, read_to_end_limited};
 
     const ZSTD_CONSOLE_LOG: &[u8] = &[
         0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x48, 0x81, 0x00, 0x00, 0x63, 0x6f, 0x6e, 0x73, 0x6f, 0x6c,
@@ -192,5 +205,16 @@ mod tests {
         assert!(rendered.contains("\"file\":\"/$bunfs/root/app.js\""));
         assert!(rendered.contains("\"sources\":[\"src/app.ts\"]"));
         assert!(rendered.contains("\"mappings\":\"AAAA\""));
+    }
+
+    #[test]
+    fn limits_decompressed_source_size() {
+        assert_eq!(
+            read_to_end_limited(Cursor::new(b"1234"), 4).unwrap(),
+            b"1234"
+        );
+        let error = read_to_end_limited(Cursor::new(b"12345"), 4)
+            .expect_err("input larger than the limit must be rejected");
+        assert!(error.to_string().contains("4-byte limit"));
     }
 }

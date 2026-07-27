@@ -32,7 +32,7 @@ const JS_MARKER_FALLBACK: &[u8] = b"// @bun";
 const WASM_MAGIC: &[u8] = b"\0asm\x01\0\0\0";
 const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BinaryInspection {
     pub bun_section_name: Option<String>,
     pub bun_section_file_offset: Option<usize>,
@@ -59,7 +59,7 @@ impl BinaryInspection {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct EmbeddedFile {
     pub virtual_path: String,
     pub kind: EmbeddedKind,
@@ -76,6 +76,7 @@ pub struct EmbeddedFile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddedKind {
+    Binary,
     JsWrapper,
     Wasm,
     MachO,
@@ -94,6 +95,7 @@ pub enum EmbeddedKind {
 impl EmbeddedKind {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Binary => "binary",
             Self::JsWrapper => "js-wrapper",
             Self::Wasm => "wasm",
             Self::MachO => "mach-o",
@@ -116,47 +118,52 @@ pub fn inspect_binary(path: &Path) -> Result<Option<BinaryInspection>, Box<dyn E
     inspect_binary_bytes(&bytes)
 }
 
-fn inspect_binary_bytes(bytes: &[u8]) -> Result<Option<BinaryInspection>, Box<dyn Error>> {
+pub(crate) fn inspect_binary_bytes(
+    bytes: &[u8],
+) -> Result<Option<BinaryInspection>, Box<dyn Error>> {
     let bun_version = detect_bun_version(bytes);
 
-    if let Some(standalone) = inspect_executable(bytes)? {
-        let raw_container_bytes = standalone.raw_container_bytes.clone();
-        let payload_bytes = standalone.payload_bytes.clone();
-        let raw_bytes = raw_container_bytes
-            .as_deref()
-            .unwrap_or(&payload_bytes)
-            .to_vec();
-        let bun_strings = printable_strings(&raw_bytes);
-        let metadata = collect_metadata(&bun_strings);
+    if let Some(mut standalone) = inspect_executable(bytes)? {
+        let bun_section_name = standalone.container.name().map(str::to_string);
+        let bun_section_file_offset = standalone.container.file_offset();
+        let bun_section_headerless_offset = standalone
+            .container
+            .length_width()
+            .map(|width| width.size());
+        let standalone_graph_file_offset = standalone.container.payload_file_offset();
         let bunfs_paths = standalone
             .bunfs_modules()
             .map(|module| module.virtual_path.clone())
             .collect::<Vec<_>>();
         let structured_files = structured_embedded_files(standalone.bunfs_modules());
+        let raw_container_bytes = standalone.container.take_bytes();
+        let payload_bytes = std::mem::take(&mut standalone.payload_bytes);
+        let raw_bytes = raw_container_bytes.as_deref().unwrap_or(&payload_bytes);
         let bunfs_paths = if bunfs_paths.is_empty() {
-            collect_bunfs_paths(&raw_bytes)
+            collect_bunfs_paths(raw_bytes)
         } else {
             bunfs_paths
         };
+        let bun_strings = printable_strings(raw_bytes);
+        let metadata = collect_metadata(&bun_strings);
+        let files = if structured_files.is_empty() {
+            extract_embedded_files(raw_bytes)
+        } else {
+            structured_files
+        };
 
         return Ok(Some(BinaryInspection {
-            bun_section_name: standalone.container_name,
-            bun_section_file_offset: standalone.raw_container_file_offset,
+            bun_section_name,
+            bun_section_file_offset,
             bun_section_bytes: raw_container_bytes.unwrap_or_default(),
-            bun_section_headerless_offset: standalone
-                .raw_container_file_offset
-                .map(|_| std::mem::size_of::<u64>()),
-            standalone_graph_file_offset: Some(standalone.payload_file_offset),
+            bun_section_headerless_offset,
+            standalone_graph_file_offset: Some(standalone_graph_file_offset),
             standalone_graph_bytes: Some(payload_bytes),
             standalone_record_layout: Some(standalone.record_layout),
             bun_version,
             bunfs_paths,
             metadata,
-            files: if structured_files.is_empty() {
-                extract_embedded_files(&raw_bytes)
-            } else {
-                structured_files
-            },
+            files,
             entry_point_path: standalone.entry_point_path,
             entry_point_source: standalone.entry_point_source,
         }));
@@ -166,7 +173,7 @@ fn inspect_binary_bytes(bytes: &[u8]) -> Result<Option<BinaryInspection>, Box<dy
     let section_bytes = bun_section
         .and_then(|section| {
             bytes
-                .get(section.fileoff..section.fileoff.saturating_add(section.filesize))
+                .get(section.fileoff..section.fileoff.checked_add(section.filesize)?)
                 .map(<[u8]>::to_vec)
         })
         .unwrap_or_default();

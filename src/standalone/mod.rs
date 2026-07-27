@@ -1,24 +1,26 @@
 use std::{collections::HashMap, error::Error};
 
 mod container;
+mod elf;
 mod layout;
+mod macho;
 mod model;
 mod parse;
+mod pe;
 #[cfg(test)]
 mod tests;
 mod write;
 
+pub(crate) use self::layout::normalize_virtual_path;
 use self::layout::{
-    BUN_SECTION_NAME, BUN_SEGMENT_NAMES, DOS_MAGIC, LC_SEGMENT, LC_SEGMENT_64, MACH_O_MAGIC_32,
-    MACH_O_MAGIC_64, OFFSETS_SIZE_64, PE_MAGIC, RawStringPointer, STRING_POINTER_SIZE, TRAILER,
-    is_bunfs_virtual_path, non_empty_pointer_offset, normalize_virtual_path, parse_offsets,
-    parse_string_pointer, read_fixed_string, read_u16_le, read_u32_le, read_u64_le,
+    OffsetsLayout, RawStringPointer, STRING_POINTER_SIZE, SectionLengthWidth, TRAILER,
+    is_bunfs_virtual_path, parse_offsets, parse_string_pointer, read_u64_le,
     slice_optional_pointer, slice_pointer,
 };
 pub(crate) use self::model::{
     ModuleRecordLayout, OptionalReplacement, RepackedExecutable, ReplacementCounts,
-    ReplacementParts, RequiredReplacement, StandaloneInspection, StandaloneModule,
-    StandaloneSidecarKind,
+    ReplacementParts, RequiredReplacement, StandaloneContainer, StandaloneInspection,
+    StandaloneModule, StandaloneSectionKind, StandaloneSidecarKind,
 };
 
 pub(crate) fn inspect_executable(

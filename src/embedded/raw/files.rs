@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 
+use crate::standalone::normalize_virtual_path;
+
 use super::super::{
     BUN_PATH_PREFIXES, EmbeddedFile, EmbeddedKind, JS_MARKER, JS_MARKER_FALLBACK,
     detect::{detect_kind, macho_length, png_length, wasm_length},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PathOccurrence {
     offset: usize,
     path: String,
@@ -29,6 +31,7 @@ pub(crate) fn extract_embedded_files(bytes: &[u8]) -> Vec<EmbeddedFile> {
             .get(index + 1)
             .map_or(bytes.len(), |next| next.offset);
         let content_end = match kind {
+            EmbeddedKind::Binary => next_path_offset,
             EmbeddedKind::JsWrapper
             | EmbeddedKind::Html
             | EmbeddedKind::Css
@@ -52,7 +55,7 @@ pub(crate) fn extract_embedded_files(bytes: &[u8]) -> Vec<EmbeddedFile> {
         let Some(content) = bytes.get(content_start..content_end) else {
             continue;
         };
-        let normalized_path = occurrence.path.trim_start_matches("file://").to_string();
+        let normalized_path = normalize_virtual_path(occurrence.path.trim_start_matches("file://"));
         files
             .entry(normalized_path.clone())
             .or_insert_with(|| EmbeddedFile {
@@ -95,7 +98,7 @@ pub(crate) fn printable_strings(bytes: &[u8]) -> String {
 pub(crate) fn collect_bunfs_paths(bytes: &[u8]) -> Vec<String> {
     let mut paths = collect_path_occurrences(bytes)
         .into_iter()
-        .map(|occurrence| occurrence.path.trim_start_matches("file://").to_string())
+        .map(|occurrence| normalize_virtual_path(occurrence.path.trim_start_matches("file://")))
         .collect::<Vec<_>>();
     paths.sort();
     paths.dedup();
@@ -103,7 +106,7 @@ pub(crate) fn collect_bunfs_paths(bytes: &[u8]) -> Vec<String> {
 }
 
 fn find_content_start(bytes: &[u8], offset: usize, path_len: usize) -> Option<usize> {
-    let mut cursor = offset + path_len;
+    let mut cursor = offset.checked_add(path_len)?;
     if cursor < bytes.len() && bytes[cursor] == 0 {
         cursor += 1;
     }
@@ -186,7 +189,9 @@ fn read_c_string_like(bytes: &[u8], start: usize) -> Option<String> {
     if end == start {
         return None;
     }
-    String::from_utf8(bytes.get(start..end)?.to_vec()).ok()
+    std::str::from_utf8(bytes.get(start..end)?)
+        .ok()
+        .map(str::to_string)
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {

@@ -158,10 +158,13 @@ fn decode_records(
     let mut buffer_cursor = 0usize;
     for record_kind in record_kinds {
         let width = record_kind.width();
+        let record_end = buffer_cursor
+            .checked_add(width)
+            .ok_or("module_info record buffer overflowed")?;
         let record = buffer
-            .get(buffer_cursor..buffer_cursor + width)
+            .get(buffer_cursor..record_end)
             .ok_or("module_info record buffer was truncated")?;
-        buffer_cursor += width;
+        buffer_cursor = record_end;
 
         match record_kind {
             ModuleInfoRecordKind::DeclaredVariable => {

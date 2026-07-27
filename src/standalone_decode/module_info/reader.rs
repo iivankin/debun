@@ -1,5 +1,7 @@
 use std::{error::Error, io};
 
+use crate::binary::read_u32_le;
+
 pub(super) fn read_len(
     bytes: &[u8],
     cursor: &mut usize,
@@ -44,11 +46,6 @@ pub(super) fn take<'a>(
         .ok_or_else(|| invalid_data(format!("{label} slice was truncated")))?;
     *cursor = end;
     Ok(slice)
-}
-
-fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
-    let chunk = bytes.get(offset..offset + 4)?;
-    Some(u32::from_le_bytes(chunk.try_into().ok()?))
 }
 
 fn invalid_data(message: impl Into<String>) -> Box<dyn Error> {

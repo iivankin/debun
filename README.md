@@ -98,8 +98,10 @@ debun pack ./out/app --out ./app-binary.repacked
 - `<dir>/files`
 - `<dir>` itself
 
-`pack` supports Bun standalone executables. It uses the saved base executable from `.debun/` and swaps only the embedded standalone payload.
-On macOS the packed output is re-signed ad-hoc automatically, because mutating the Mach-O bytes invalidates the original embedded signature.
+`pack` supports Bun standalone executables, including legacy Bun 1.0 and 1.1 layouts. It uses the saved base executable from `.debun/` and swaps only the embedded standalone payload.
+Removing an extracted optional `.bin` sidecar removes that part from the packed module. Every main BunFS file must remain present; `pack` rejects missing module contents, unknown files, modified decoded `.json` helpers, and symlinks.
+Section-backed standalone payloads may grow beyond their original capacity. Linux ELF expands the containing `PT_LOAD`, macOS Mach-O expands `__BUN` and shifts `__LINKEDIT`, and unsigned Windows PE expands its final `.bun` section while preserving any file overlay.
+On macOS section-backed packed output is re-signed ad-hoc automatically, because mutating the Mach-O bytes invalidates the original embedded signature. Legacy appended-payload Mach-O output remains unsigned because its standalone footer must stay at end of file. Authenticode-signed PE files are rejected instead of silently invalidating their signature.
 
 ## Patch Workflow
 
@@ -112,8 +114,9 @@ debun patch ./out/app --out ./app-binary.patch
 debun apply-patch ./app-binary.patch ./app-binary --out ./app-binary.patched
 ```
 
-`patch` compares the edited workspace against the saved base executable under `.debun/` and writes a debun `.patch` bundle.
-`apply-patch` validates that the target standalone binary still matches the original bytes expected by the patch before rebuilding the embedded payload.
+`patch` compares the edited workspace against the saved base executable under `.debun/` and writes a compact binary `debun-patch/v2` bundle.
+The bundle stores raw replacement bytes and SHA-256 hashes of the expected original parts instead of duplicating the originals.
+`apply-patch` verifies those hashes against the target standalone binary before rebuilding the embedded payload.
 
 The patch workflow follows the same packable surface as `pack`:
 - BunFS file contents
@@ -121,13 +124,14 @@ The patch workflow follows the same packable surface as `pack`:
 - `.debun-bytecode.bin`
 - `.debun-module-info.bin`
 
-Decoded helper files like `.debun-sourcemap.json` and `.debun-module-info.json` are read-only views and are not included in patches.
+Decoded helper files like `.debun-sourcemap.json` and `.debun-module-info.json` are read-only views and are not included in patches. Zstd source content is limited to 512 MiB per source while generating decoded sourcemap JSON; the original binary sidecar remains available when decoding is rejected.
 
 ## What Works Well
 
 - Bun native binaries
 - Bun asset bundles embedded into a compiled server binary
 - binaries that contain a `__BUN` section with BunFS paths and inline payloads
+- modern Linux Bun executables that store the standalone graph in an ELF `.bun` section
 - Linux-style Bun executables that append the standalone graph trailer instead of using a `__BUN` section
 
 ## Current Scope

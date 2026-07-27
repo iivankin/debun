@@ -1,15 +1,14 @@
 use super::layout::{
-    MODULE_RECORD_SIZE_COMPACT, MODULE_RECORD_SIZE_EXTENDED, MODULE_RECORD_SIZE_WITH_MODULE_INFO,
-    is_bunfs_virtual_path,
+    MODULE_RECORD_SIZE_COMPACT, MODULE_RECORD_SIZE_EXTENDED, MODULE_RECORD_SIZE_LEGACY_ENCODING,
+    MODULE_RECORD_SIZE_LEGACY_LOADER, MODULE_RECORD_SIZE_WITH_MODULE_INFO, OffsetsLayout,
+    SectionLengthWidth, is_bunfs_virtual_path,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct StandaloneInspection {
-    pub(crate) container_name: Option<String>,
-    pub(crate) raw_container_file_offset: Option<usize>,
-    pub(crate) raw_container_bytes: Option<Vec<u8>>,
-    pub(crate) payload_file_offset: usize,
+    pub(crate) container: StandaloneContainer,
     pub(crate) payload_bytes: Vec<u8>,
+    pub(crate) offsets_layout: OffsetsLayout,
     pub(crate) record_layout: ModuleRecordLayout,
     pub(crate) entry_point_path: Option<String>,
     pub(crate) entry_point_source: Option<String>,
@@ -17,6 +16,82 @@ pub(crate) struct StandaloneInspection {
     pub(crate) compile_exec_argv: Option<Vec<u8>>,
     pub(crate) flags_bits: u32,
     pub(crate) modules: Vec<StandaloneModule>,
+}
+
+#[derive(Debug)]
+pub(crate) enum StandaloneContainer {
+    Appended {
+        payload_file_offset: usize,
+    },
+    Section {
+        kind: StandaloneSectionKind,
+        name: String,
+        file_offset: usize,
+        bytes: Vec<u8>,
+        payload_file_offset: usize,
+        length_width: SectionLengthWidth,
+    },
+}
+
+impl StandaloneContainer {
+    pub(crate) fn name(&self) -> Option<&str> {
+        match self {
+            Self::Appended { .. } => None,
+            Self::Section { name, .. } => Some(name),
+        }
+    }
+
+    pub(crate) const fn file_offset(&self) -> Option<usize> {
+        match self {
+            Self::Appended { .. } => None,
+            Self::Section { file_offset, .. } => Some(*file_offset),
+        }
+    }
+
+    pub(crate) fn take_bytes(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Self::Appended { .. } => None,
+            Self::Section { bytes, .. } => Some(std::mem::take(bytes)),
+        }
+    }
+
+    pub(crate) const fn payload_file_offset(&self) -> usize {
+        match self {
+            Self::Appended {
+                payload_file_offset,
+            }
+            | Self::Section {
+                payload_file_offset,
+                ..
+            } => *payload_file_offset,
+        }
+    }
+
+    pub(crate) const fn length_width(&self) -> Option<SectionLengthWidth> {
+        match self {
+            Self::Appended { .. } => None,
+            Self::Section { length_width, .. } => Some(*length_width),
+        }
+    }
+
+    pub(crate) const fn is_macho_section(&self) -> bool {
+        matches!(
+            self,
+            Self::Section {
+                kind: StandaloneSectionKind::MachO32 | StandaloneSectionKind::MachO64,
+                ..
+            }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StandaloneSectionKind {
+    Elf,
+    MachO32,
+    MachO64,
+    Pe32,
+    Pe64,
 }
 
 impl StandaloneInspection {
@@ -30,7 +105,7 @@ impl StandaloneInspection {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct StandaloneModule {
     pub(crate) original_path: String,
     pub(crate) virtual_path: String,
@@ -82,6 +157,8 @@ impl StandaloneSidecarKind {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ModuleRecordLayout {
+    LegacyLoader,
+    LegacyEncoding,
     Compact,
     WithModuleInfo,
     Extended,
@@ -90,6 +167,8 @@ pub(crate) enum ModuleRecordLayout {
 impl ModuleRecordLayout {
     pub(crate) const fn size(self) -> usize {
         match self {
+            Self::LegacyLoader => MODULE_RECORD_SIZE_LEGACY_LOADER,
+            Self::LegacyEncoding => MODULE_RECORD_SIZE_LEGACY_ENCODING,
             Self::Compact => MODULE_RECORD_SIZE_COMPACT,
             Self::WithModuleInfo => MODULE_RECORD_SIZE_WITH_MODULE_INFO,
             Self::Extended => MODULE_RECORD_SIZE_EXTENDED,
@@ -98,6 +177,8 @@ impl ModuleRecordLayout {
 
     pub(crate) const fn label(self) -> &'static str {
         match self {
+            Self::LegacyLoader => "legacy-loader",
+            Self::LegacyEncoding => "legacy-encoding",
             Self::Compact => "compact",
             Self::WithModuleInfo => "with-module-info",
             Self::Extended => "extended",
@@ -105,7 +186,7 @@ impl ModuleRecordLayout {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct ReplacementParts {
     pub(crate) contents: RequiredReplacement,
     pub(crate) sourcemap: OptionalReplacement,
@@ -122,7 +203,7 @@ impl ReplacementParts {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) enum RequiredReplacement {
     #[default]
     Keep,
@@ -135,7 +216,7 @@ impl RequiredReplacement {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) enum OptionalReplacement {
     #[default]
     Keep,

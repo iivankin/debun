@@ -19,13 +19,17 @@ pub fn write_outputs(
     inspection: Option<&BinaryInspection>,
     artifacts: &TransformArtifacts,
 ) -> Result<WrittenOutputs, Box<dyn Error>> {
+    // Preserve the original executable before cleaning any workspace output.
+    // The input may itself be a previously saved .debun/base-executable.
+    let pack_support = writer::write_pack_support(config, inspection)?;
+
     writer::remove_legacy_outputs(&config.out_dir)?;
 
     let outputs = WrittenOutputs {
         symbols: writer::write_symbols_output(config, artifacts)?,
         modules: writer::write_modules_output(config, &artifacts.modules)?,
         embedded_manifest: writer::write_embedded_outputs(config, inspection)?,
-        pack_support: writer::write_pack_support(config, inspection)?,
+        pack_support,
         warnings: writer::write_warnings_output(config, artifacts)?,
     };
 

@@ -1,4 +1,4 @@
-use super::{EmbeddedKind, structured::structured_embedded_files};
+use super::{EmbeddedKind, raw::collect_bunfs_paths, structured::structured_embedded_files};
 use crate::standalone::StandaloneModule;
 
 #[test]
@@ -41,4 +41,38 @@ fn structured_standalone_files_include_sidecars() {
     assert_eq!(bytecode.source_offset, 789);
     assert_eq!(module_info.kind, EmbeddedKind::StandaloneModuleInfo);
     assert_eq!(module_info.source_offset, 999);
+}
+
+#[test]
+fn structured_standalone_files_keep_unknown_binary_assets() {
+    let module = StandaloneModule {
+        original_path: "/$bunfs/root/data.bin".to_string(),
+        virtual_path: "/$bunfs/root/data.bin".to_string(),
+        source_offset: 123,
+        bytes: vec![0xff, 0x00, 0x80, 0x01],
+        sourcemap: None,
+        sourcemap_offset: None,
+        bytecode: None,
+        bytecode_offset: None,
+        module_info: None,
+        module_info_offset: None,
+        bytecode_origin_path: None,
+        encoding: 0,
+        loader: 1,
+        module_format: 0,
+        side: 0,
+    };
+
+    let files = structured_embedded_files([&module]);
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].kind, EmbeddedKind::Binary);
+    assert_eq!(files[0].bytes, module.bytes);
+}
+
+#[test]
+fn raw_windows_bunfs_paths_use_the_workspace_layout() {
+    let paths = collect_bunfs_paths(b"B:/~BUN/root/assets/data.bin\0");
+
+    assert_eq!(paths, ["/$bunfs/root/assets/data.bin"]);
 }

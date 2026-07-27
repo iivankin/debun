@@ -2,7 +2,7 @@ use std::{error::Error, fs, path::Path};
 
 const BUN_JS_MARKER: &[u8] = b"// @bun";
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ExtractedSource {
     pub source: String,
     pub trimmed_prefix: usize,

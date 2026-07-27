@@ -194,7 +194,11 @@ fn read_uleb128(bytes: &[u8]) -> Option<(u64, usize)> {
     let mut value = 0u64;
     let mut shift = 0u32;
     for (index, byte) in bytes.iter().copied().enumerate() {
-        value |= u64::from(byte & 0x7f) << shift;
+        let payload = u64::from(byte & 0x7f);
+        if shift == 63 && payload > 1 {
+            return None;
+        }
+        value |= payload.checked_shl(shift)?;
         if byte & 0x80 == 0 {
             return Some((value, index + 1));
         }
@@ -268,4 +272,15 @@ fn has_extension(path: &str, expected: &str) -> bool {
     Path::new(path)
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_uleb128;
+
+    #[test]
+    fn rejects_uleb128_values_larger_than_u64() {
+        let overflow = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
+        assert_eq!(read_uleb128(&overflow), None);
+    }
 }

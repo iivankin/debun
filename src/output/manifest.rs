@@ -20,7 +20,7 @@ pub(super) fn render_embedded_manifest_json(inspection: &BinaryInspection) -> St
     let metadata = inspection
         .metadata
         .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect::<BTreeMap<_, _>>();
 
     let files_json = inspection
