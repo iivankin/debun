@@ -436,6 +436,60 @@ fn rejects_nonempty_optional_parts_with_invalid_pointers() {
 }
 
 #[test]
+fn ends_linked_bytecode_at_the_next_module_entry() {
+    let mut payload = build_payload(
+        &[
+            TestModule {
+                name: "/$bunfs/root/app.js",
+                contents: b"console.log('ok');",
+                sourcemap: b"",
+                bytecode: b"ENTRY0ENTRY1SHARED",
+                module_info: b"",
+                bytecode_origin_path: None,
+            },
+            TestModule {
+                name: "/$bunfs/root/chunk.js",
+                contents: b"export {};",
+                sourcemap: b"",
+                bytecode: b"",
+                module_info: b"",
+                bytecode_origin_path: None,
+            },
+        ],
+        0,
+        TestModuleRecordLayout::Compact,
+    );
+    let offsets_start = payload.len() - TRAILER.len() - OffsetsLayout::WithCompileArgv.size();
+    let modules_offset = usize::try_from(u32::from_le_bytes(
+        payload[offsets_start + 8..offsets_start + 12]
+            .try_into()
+            .unwrap(),
+    ))
+    .unwrap();
+    let payload_offset = u32::from_le_bytes(
+        payload[modules_offset + 24..modules_offset + 28]
+            .try_into()
+            .unwrap(),
+    );
+    let second_bytecode = modules_offset + MODULE_RECORD_SIZE_COMPACT + 24;
+    payload[second_bytecode..second_bytecode + 4]
+        .copy_from_slice(&(payload_offset + 6).to_le_bytes());
+    payload[second_bytecode + 4..second_bytecode + 8].copy_from_slice(&12_u32.to_le_bytes());
+    let (exe, _) = build_appended_executable(&payload);
+
+    let inspection = inspect_executable(&exe)
+        .expect("standalone parse should succeed")
+        .expect("standalone graph should be detected");
+    let files = inspection.bunfs_modules().collect::<Vec<_>>();
+    let [entry, chunk] = files.as_slice() else {
+        panic!("expected two bunfs files");
+    };
+
+    assert_eq!(entry.bytecode.as_deref(), Some(b"ENTRY0".as_slice()));
+    assert_eq!(chunk.bytecode.as_deref(), Some(b"ENTRY1SHARED".as_slice()));
+}
+
+#[test]
 fn repacks_appended_standalone_graph_with_replacements() {
     let payload = build_payload(
         &[

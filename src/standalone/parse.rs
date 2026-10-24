@@ -56,8 +56,9 @@ pub(super) fn parse_payload(
     let body = &payload.payload_bytes[..offsets.byte_count];
     let modules_bytes = slice_pointer(body, offsets.modules_ptr)
         .ok_or("standalone payload module list pointer was out of bounds")?;
-    let (record_layout, records) =
+    let (record_layout, mut records) =
         parse_module_records(body, modules_bytes, offsets.entry_point_id)?;
+    end_bytecode_at_next_entry(&mut records);
     let compile_exec_argv =
         slice_optional_pointer(body, offsets.compile_exec_argv_ptr).map(<[u8]>::to_vec);
     let entry_point_index = usize::try_from(offsets.entry_point_id)
@@ -364,6 +365,34 @@ fn try_parse_module_records(
     }
 
     Some(records)
+}
+
+/// Executables built with a bytecode order file keep one linked bytecode payload,
+/// and every module's bytecode pointer runs from its cache entry to the end of that
+/// shared payload. Copying each pointer whole duplicates the payload once per module,
+/// so end each module's bytecode where the next module's entry starts. The slices then
+/// cover the payload once, and disjoint layouts are unchanged.
+fn end_bytecode_at_next_entry(records: &mut [ParsedModuleRecord]) {
+    let mut starts = records
+        .iter()
+        .filter(|record| record.bytecode_ptr.length > 0)
+        .map(|record| record.bytecode_ptr.offset)
+        .collect::<Vec<_>>();
+    starts.sort_unstable();
+    starts.dedup();
+
+    for record in records {
+        let pointer = &mut record.bytecode_ptr;
+        if pointer.length == 0 {
+            continue;
+        }
+        let next = starts.partition_point(|&start| start <= pointer.offset);
+        if let Some(&next_start) = starts.get(next)
+            && u64::from(next_start) < u64::from(pointer.offset) + u64::from(pointer.length)
+        {
+            pointer.length = next_start - pointer.offset;
+        }
+    }
 }
 
 fn validate_optional_pointer(body: &[u8], pointer: RawStringPointer) -> Option<()> {
